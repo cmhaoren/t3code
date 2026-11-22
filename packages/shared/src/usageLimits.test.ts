@@ -2011,3 +2011,179 @@ describe("ChatGPT sharing presentation", () => {
     ).toBe(false);
   });
 });
+
+describe("grouped ACP Registry limits (Factory Droid)", () => {
+  const checkedAt = "2026-11-22T08:00:00.000Z";
+  const droidGroup = { id: "acpRegistry:factory-droid", label: "Factory Droid" } as const;
+  const otherGroup = { id: "acpRegistry:other-agent", label: "Other Agent" } as const;
+  const standardWeekly = {
+    id: "standard-weekly",
+    kind: "weekly" as const,
+    label: "Standard · Weekly",
+    usedPercent: 100,
+    resetsAt: "2026-11-23T05:00:00.000Z",
+    windowDurationMins: 10_080,
+    blocksModel: false,
+  };
+  const core5h = {
+    id: "core-5h",
+    kind: "session" as const,
+    label: "Core · 5h",
+    usedPercent: 30,
+    resetsAt: "2026-11-22T10:53:00.000Z",
+    windowDurationMins: 300,
+    blocksModel: false,
+  };
+  const standard5h = {
+    id: "standard-5h",
+    kind: "session" as const,
+    label: "Standard · 5h",
+    usedPercent: 0,
+    windowDurationMins: 300,
+    blocksModel: false,
+  };
+  const droid = provider({
+    instanceId: ProviderInstanceId.make("factory-droid"),
+    driver: ProviderDriverKind.make("acpRegistry"),
+    displayName: "Factory Droid",
+    iconUrl: "https://cdn.agentclientprotocol.com/registry/v1/latest/factory-droid.svg",
+    auth: { status: "authenticated", email: "dev@example.com", label: "Factory Pro Annual Plan" },
+    usageLimits: {
+      checkedAt,
+      group: droidGroup,
+      externalUsage: { label: "Factory usage", url: "https://app.factory.ai/settings/billing" },
+      windows: [standard5h, standardWeekly, core5h],
+    },
+  });
+  const otherAcp = provider({
+    instanceId: ProviderInstanceId.make("other-acp"),
+    driver: ProviderDriverKind.make("acpRegistry"),
+    displayName: "Other ACP",
+  });
+  const otherGroupedAcp = provider({
+    instanceId: ProviderInstanceId.make("other-grouped"),
+    driver: ProviderDriverKind.make("acpRegistry"),
+    displayName: "Other Agent",
+    auth: { status: "authenticated", email: "dev@example.com" },
+    usageLimits: {
+      checkedAt,
+      group: otherGroup,
+      windows: [{ ...window, usedPercent: 25 }],
+    },
+  });
+
+  it("pools by group id, carries iconUrl, and orders Standard windows before Core", () => {
+    const presentations = new Map([
+      [
+        EnvironmentId.make("local"),
+        {
+          entry: { target: { label: "Local" } },
+          serverConfig: { providers: [droid, otherGroupedAcp] },
+        },
+      ],
+    ]);
+    const accounts = collectLimitAccounts(presentations);
+    expect(accounts).toHaveLength(2);
+    expect(accounts[0]?.iconUrl).toBe(droid.iconUrl);
+
+    const pools = collectLimitPools(accounts, Date.parse(checkedAt));
+    expect(
+      pools.map((pool) => ({ id: pool.id, title: pool.title, iconUrl: pool.iconUrl })),
+    ).toEqual([
+      { id: "acpRegistry:factory-droid", title: "Factory Droid", iconUrl: droid.iconUrl },
+      { id: "acpRegistry:other-agent", title: "Other Agent", iconUrl: undefined },
+    ]);
+
+    const factoryPool = pools[0]!;
+    expect(displayLimitWindows(factoryPool).map((w) => w.id)).toEqual([
+      "standard-5h",
+      "standard-weekly",
+      "core-5h",
+    ]);
+  });
+
+  it("skips non-blocking exhausted windows in exhaustedUsageWindow", () => {
+    expect(exhaustedUsageWindow(droid, Date.parse(checkedAt))).toBeUndefined();
+    const blockingDroid = provider({
+      ...droid,
+      usageLimits: {
+        ...droid.usageLimits!,
+        windows: [{ ...standardWeekly, blocksModel: undefined }],
+      },
+    });
+    expect(exhaustedUsageWindow(blockingDroid, Date.parse(checkedAt))?.id).toBe("standard-weekly");
+  });
+
+  it("scopes /usage-limits and collectProviderUsageLimits without leaking to other ACP agents or hubs", () => {
+    const ungroupedHub = {
+      id: UsageLimitSourceId.make("hub"),
+      kind: "cliproxy" as const,
+      label: "Hub",
+      checkedAt,
+      accounts: [
+        {
+          id: "acp.json",
+          driver: ProviderDriverKind.make("acpRegistry"),
+          usageLimits: { checkedAt, windows: [window] },
+        },
+      ],
+    };
+    const [annotatedDroid, annotatedOther] = withUsageLimitsCommands(
+      [droid, otherAcp],
+      [ungroupedHub],
+    );
+    expect(annotatedDroid?.slashCommands.map((c) => c.name)).toEqual(["usage-limits"]);
+    expect(annotatedOther?.slashCommands.map((c) => c.name)).toEqual(["usage-limits"]);
+
+    // Without hub accounts, other ACP agents do not inherit Factory Droid's /usage-limits command.
+    const [noHubDroid, noHubOther] = withUsageLimitsCommands([droid, otherAcp], []);
+    expect(noHubDroid?.slashCommands.map((c) => c.name)).toEqual(["usage-limits"]);
+    expect(noHubOther?.slashCommands).toEqual([]);
+
+    const report = collectProviderUsageLimits(
+      droid.instanceId,
+      [droid, otherGroupedAcp],
+      [ungroupedHub],
+      Date.parse(checkedAt),
+    );
+    expect(report?.accounts.map((account) => account.id)).toEqual([droid.instanceId]);
+  });
+
+  it("collects external usage links when auth status is unknown, not unauthenticated", () => {
+    const unknownAuthDroid = provider({
+      ...droid,
+      auth: { status: "unknown" },
+      usageLimits: {
+        checkedAt,
+        windows: [],
+        group: droidGroup,
+        externalUsage: { label: "Factory usage", url: "https://app.factory.ai/settings/billing" },
+        unavailable: { reason: "unsupported", message: "Sign in to Factory Droid." },
+      },
+    });
+    const unauthDroid = { ...unknownAuthDroid, auth: { status: "unauthenticated" as const } };
+    expect(
+      collectExternalUsageLinks(
+        new Map([
+          [
+            EnvironmentId.make("local"),
+            {
+              entry: { target: { label: "Host" } },
+              serverConfig: { providers: [unknownAuthDroid] },
+            },
+          ],
+        ]),
+      ),
+    ).toHaveLength(1);
+    expect(
+      collectExternalUsageLinks(
+        new Map([
+          [
+            EnvironmentId.make("local"),
+            { entry: { target: { label: "Host" } }, serverConfig: { providers: [unauthDroid] } },
+          ],
+        ]),
+      ),
+    ).toEqual([]);
+  });
+});

@@ -13,6 +13,7 @@ import { AcpRegistrySettings } from "../settings.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
@@ -25,6 +26,7 @@ import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as HttpClient from "effect/http/HttpClient";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -32,6 +34,10 @@ import { AcpRegistryAdapterV2Driver, type AcpRegistryAdapterV2DriverEnv } from "
 import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import type {
+  ManagedServerProvider,
+  ProviderUsageLimitsReport,
+} from "@t3tools/provider-core/server/snapshot";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import {
   defaultProviderContinuationIdentity,
@@ -48,6 +54,7 @@ import {
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
 } from "@t3tools/provider-core/server/snapshotSettings";
+import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
 import {
   type AcpRegistryAvailableCommands,
   type AcpRegistryConfigurationProbe,
@@ -65,6 +72,11 @@ import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpRegistryAuth from "./auth.ts";
 import * as AcpRegistryAuthenticationState from "./authenticationState.ts";
+import {
+  type FactoryUsageLimitsResult,
+  isFactoryDroidInstance,
+  readFactoryUsageLimits,
+} from "./factoryUsageLimits.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
 const decodeSettings = Schema.decodeSync(AcpRegistrySettings);
@@ -431,6 +443,57 @@ function applyAcpRegistryUrlAuthAction(
   };
 }
 
+function applyFactoryUsageState(
+  provider: ServerProvider,
+  result: FactoryUsageLimitsResult,
+): ServerProvider {
+  const usageLimits = resolveUsageLimitsAfterProbe({
+    published: provider.usageLimits,
+    probed: result.usageLimits,
+  });
+  const nextAuth = {
+    ...provider.auth,
+    ...(provider.auth.status === "unknown" &&
+    !result.usageLimits.unavailable &&
+    provider.enabled &&
+    provider.installed
+      ? { status: "authenticated" as const }
+      : {}),
+    ...(result.auth?.email && !provider.auth.email ? { email: result.auth.email } : {}),
+    ...(result.auth?.label && !provider.auth.label ? { label: result.auth.label } : {}),
+    ...(result.auth?.workspaceId && !provider.auth.workspaceId
+      ? { workspaceId: result.auth.workspaceId }
+      : {}),
+  };
+  return {
+    ...provider,
+    auth: nextAuth,
+    ...(usageLimits ? { usageLimits } : {}),
+  };
+}
+
+function toFactoryUsageLimitsReport(result: FactoryUsageLimitsResult): ProviderUsageLimitsReport {
+  const { usageLimits, auth } = result;
+  return {
+    checkedAt: usageLimits.checkedAt,
+    windows: usageLimits.windows,
+    preserveWindowOrder: true,
+    complete: true,
+    ...(usageLimits.group !== undefined ? { group: usageLimits.group } : {}),
+    ...(usageLimits.externalUsage !== undefined
+      ? { externalUsage: usageLimits.externalUsage }
+      : {}),
+    ...(usageLimits.unavailable !== undefined ? { unavailable: usageLimits.unavailable } : {}),
+    ...(usageLimits.credentialFingerprint !== undefined
+      ? { credentialFingerprint: usageLimits.credentialFingerprint }
+      : {}),
+    ...(auth?.label !== undefined ? { authLabel: auth.label } : {}),
+    ...(auth?.email !== undefined ? { authEmail: auth.email } : {}),
+    ...(auth?.workspaceId !== undefined ? { authWorkspaceId: auth.workspaceId } : {}),
+    ...(usageLimits.unavailable === undefined ? { authStatus: "authenticated" as const } : {}),
+  };
+}
+
 const buildInitialAcpRegistrySnapshot = Effect.fn("AcpRegistryDriver.buildInitialSnapshot")(
   function* (input: SnapshotIdentity & { readonly settings: AcpRegistrySettings }) {
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
@@ -600,9 +663,12 @@ export const checkAcpRegistryProviderReadiness = Effect.fn(
     : snapshot;
 });
 
+const FACTORY_USAGE_CACHE_TTL_MS = 5 * 60 * 1_000;
+
 export type AcpRegistryDriverEnv =
   | AcpRegistryAdapterV2DriverEnv
   | Digest.Digest
+  | HttpClient.HttpClient
   | ProviderHost.ProviderHost;
 
 export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryDriverEnv> = {
@@ -639,6 +705,9 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const httpClient = yield* HttpClient.HttpClient;
+    const hostPlatform = yield* HostProcess.Platform;
+    const hostHomeDirectory = yield* HostProcess.HomeDirectory;
     const hostEnvironment = yield* HostProcess.Environment;
     const host = yield* ProviderHost.ProviderHost;
     const continuationIdentity = defaultProviderContinuationIdentity({
@@ -687,6 +756,65 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         environment,
         processEnvironment,
       });
+    const isFactoryDroid = isFactoryDroidInstance(effectiveConfig);
+    interface FactoryUsageCacheState {
+      readonly generation: number;
+      readonly entry: {
+        readonly result: FactoryUsageLimitsResult;
+        readonly expiresAt: number;
+      } | null;
+    }
+    const factoryUsageCache = isFactoryDroid
+      ? yield* Ref.make<FactoryUsageCacheState>({ generation: 0, entry: null })
+      : null;
+    const invalidateFactoryUsageCache =
+      factoryUsageCache === null
+        ? Effect.void
+        : Ref.update(factoryUsageCache, (current) => ({
+            generation: current.generation + 1,
+            entry: current.entry === null ? null : { ...current.entry, expiresAt: 0 },
+          }));
+    const clearFactoryUsageCache =
+      factoryUsageCache === null
+        ? Effect.void
+        : Ref.update(factoryUsageCache, (current) => ({
+            generation: current.generation + 1,
+            entry: null,
+          }));
+    const readFactoryUsageCached =
+      factoryUsageCache === null
+        ? undefined
+        : Effect.fn("AcpRegistryDriver.readFactoryUsageCached")(function* () {
+            const now = yield* Clock.currentTimeMillis;
+            const cacheState = yield* Ref.get(factoryUsageCache);
+            if (cacheState.entry !== null && cacheState.entry.expiresAt > now) {
+              return { result: cacheState.entry.result, generation: cacheState.generation };
+            }
+            const startedGeneration = cacheState.generation;
+            const result = yield* readFactoryUsageLimits(processEnvironment).pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.provideService(HttpClient.HttpClient, httpClient),
+              Effect.provideService(HostProcess.Platform, hostPlatform),
+              Effect.provideService(HostProcess.HomeDirectory, hostHomeDirectory),
+            );
+            const completedAt = yield* Clock.currentTimeMillis;
+            return yield* Ref.modify(factoryUsageCache, (current) =>
+              current.generation !== startedGeneration
+                ? ([null, current] as const)
+                : ([
+                    { result, generation: startedGeneration },
+                    {
+                      generation: startedGeneration,
+                      entry: {
+                        result,
+                        expiresAt: completedAt + FACTORY_USAGE_CACHE_TTL_MS,
+                      },
+                    },
+                  ] as const),
+            );
+          });
     // Refreshes rebuild the snapshot from the probe, so per-model options
     // learned from earlier sessions are kept here.
     const learnedModels = yield* Ref.make<ReadonlyArray<ServerProviderModel>>([]);
@@ -715,7 +843,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         (yield* confirmedAuthentication.get)
           ? { ...input, auth: { ...input.auth, status: "authenticated" as const } }
           : input;
-      return yield* Option.isNone(runtimeCoordinator)
+      const runtimeApplied = yield* Option.isNone(runtimeCoordinator)
         ? Effect.succeed(provider)
         : Effect.all({
             commands: runtimeCoordinator.value.getAvailableCommands(instanceId),
@@ -735,6 +863,11 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
               );
             }),
           );
+      if (factoryUsageCache === null) return runtimeApplied;
+      const cachedFactory = yield* Ref.get(factoryUsageCache);
+      return cachedFactory.entry === null
+        ? runtimeApplied
+        : applyFactoryUsageState(runtimeApplied, cachedFactory.entry.result);
     });
     // A local executable's version comes only from probing it, so readiness checks reuse the last report.
     const reportedLocalVersion = yield* Ref.make<string | null>(null);
@@ -773,6 +906,9 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       generation: current.generation + 1,
       entry: null,
     }));
+    const invalidateAccountCaches = liveSnapshotSemaphore
+      .withPermit(invalidateEnrichmentCache)
+      .pipe(Effect.andThen(clearFactoryUsageCache));
     const enrichProviderCached = Effect.fn("AcpRegistryDriver.enrichProviderCached")(function* (
       baseSnapshot: ServerProvider,
     ) {
@@ -791,6 +927,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         return {
           provider: { ...cached.provider, checkedAt: baseSnapshot.checkedAt },
           generation: cacheState.generation,
+          refreshed: false,
         };
       }
       const enriched = yield* enrichProvider;
@@ -811,10 +948,10 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             : current,
         );
       }
-      return { provider: enriched, generation: cacheState.generation };
+      return { provider: enriched, generation: cacheState.generation, refreshed: true };
     });
     const snapshotSettings = yield* makeProviderSnapshotSettingsSource(effectiveConfig);
-    const snapshot = yield* makeManagedServerProvider<
+    const snapshot: ManagedServerProvider = yield* makeManagedServerProvider<
       ProviderSnapshotSettings<AcpRegistrySettings>
     >({
       resolveMaintenance: () => Effect.succeed(MAINTENANCE),
@@ -824,39 +961,110 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       // Inspection may fetch the registry when its disk cache is missing; creation must not wait on that.
       initialSnapshot: () => buildInitialAcpRegistrySnapshot(readinessInput),
       checkProvider,
-      enrichSnapshot: Effect.fn("enrichSnapshot")(function ({
-        snapshot,
+      ...(readFactoryUsageCached === undefined
+        ? {}
+        : {
+            checkUsageLimits: invalidateFactoryUsageCache.pipe(
+              Effect.andThen(readFactoryUsageCached()),
+              Effect.map((fetched) => fetched?.result.usageLimits),
+            ),
+            invalidateUsageCache: invalidateFactoryUsageCache,
+          }),
+      enrichSnapshot: Effect.fn("enrichSnapshot")(function* ({
+        snapshot: baseSnapshot,
         getSnapshot,
         publishSnapshot,
       }) {
-        if (!snapshot.installed) return Effect.void;
+        if (!baseSnapshot.installed) return;
+        const enrichmentOutcome =
+          readFactoryUsageCached === undefined ? null : yield* Deferred.make<boolean>();
         const publishEnrichment = (
           Option.isSome(runtimeCoordinator)
             ? runtimeCoordinator.value.runBackgroundProbe(
                 effectiveConfig.source === "local"
                   ? `local:${instanceId}`
                   : effectiveConfig.agentId,
-                enrichProviderCached(snapshot),
+                enrichProviderCached(baseSnapshot),
               )
-            : enrichProviderCached(snapshot).pipe(Effect.asSome)
+            : enrichProviderCached(baseSnapshot).pipe(Effect.asSome)
         ).pipe(
           Effect.flatMap(
             Option.match({
-              onNone: () => Effect.void,
-              onSome: ({ provider, generation }) =>
-                liveSnapshotSemaphore.withPermit(
-                  Ref.get(enrichmentCache).pipe(
-                    Effect.flatMap((current) =>
-                      current.generation === generation
-                        ? withLiveRuntimeState(provider).pipe(Effect.flatMap(publishSnapshot))
-                        : Effect.void,
+              onNone: () =>
+                enrichmentOutcome === null
+                  ? Effect.void
+                  : Deferred.succeed(enrichmentOutcome, false).pipe(Effect.asVoid),
+              onSome: ({ provider, generation, refreshed }) =>
+                liveSnapshotSemaphore
+                  .withPermit(
+                    Ref.get(enrichmentCache).pipe(
+                      Effect.flatMap((current) =>
+                        current.generation === generation
+                          ? withLiveRuntimeState(provider).pipe(Effect.flatMap(publishSnapshot))
+                          : Effect.void,
+                      ),
+                    ),
+                  )
+                  .pipe(
+                    Effect.tap(() =>
+                      enrichmentOutcome === null
+                        ? Effect.void
+                        : Deferred.succeed(
+                            enrichmentOutcome,
+                            refreshed && provider.status === "ready",
+                          ).pipe(Effect.asVoid),
                     ),
                   ),
-                ),
             }),
           ),
+          Effect.onExit(() =>
+            enrichmentOutcome === null
+              ? Effect.void
+              : Deferred.succeed(enrichmentOutcome, false).pipe(Effect.ignore),
+          ),
         );
-        if (Option.isNone(runtimeCoordinator)) return publishEnrichment;
+        const publishFactoryUsage =
+          readFactoryUsageCached === undefined || factoryUsageCache === null
+            ? null
+            : Effect.gen(function* () {
+                const publishLatest = (
+                  fetched: {
+                    readonly result: FactoryUsageLimitsResult;
+                    readonly generation: number;
+                  } | null,
+                ) =>
+                  fetched === null
+                    ? Effect.void
+                    : liveSnapshotSemaphore.withPermit(
+                        Ref.get(factoryUsageCache).pipe(
+                          Effect.flatMap((current) =>
+                            current.generation === fetched.generation
+                              ? snapshot.applyUsageLimits(
+                                  toFactoryUsageLimitsReport(fetched.result),
+                                )
+                              : Effect.void,
+                          ),
+                        ),
+                      );
+                const initial = yield* readFactoryUsageCached();
+                yield* publishLatest(initial);
+                // An ACP probe starts Droid, which refreshes an expired auth.v2.keyring token.
+                if (initial?.result.authRejected === true && enrichmentOutcome !== null) {
+                  const probeRefreshed = yield* Deferred.await(enrichmentOutcome);
+                  if (probeRefreshed) {
+                    yield* invalidateFactoryUsageCache;
+                    const retried = yield* readFactoryUsageCached();
+                    yield* publishLatest(retried);
+                  }
+                }
+              });
+        const foregroundTasks = [
+          publishEnrichment,
+          ...(publishFactoryUsage === null ? [] : [publishFactoryUsage]),
+        ];
+        if (Option.isNone(runtimeCoordinator)) {
+          return yield* Effect.all(foregroundTasks, { concurrency: "unbounded", discard: true });
+        }
 
         const publishLiveCommands = runtimeCoordinator.value.watchAvailableCommands(
           instanceId,
@@ -910,8 +1118,8 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
               ),
             ),
         );
-        return Effect.all(
-          [publishEnrichment, publishLiveCommands, publishLiveConfiguration, publishUrlAuthAction],
+        return yield* Effect.all(
+          [...foregroundTasks, publishLiveCommands, publishLiveConfiguration, publishUrlAuthAction],
           {
             concurrency: "unbounded",
             discard: true,
@@ -971,7 +1179,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
           .set(authenticated)
           .pipe(
             Effect.andThen(authenticated ? Effect.void : clearLiveState),
-            Effect.andThen(liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache)),
+            Effect.andThen(invalidateAccountCaches),
             Effect.andThen(snapshot.refresh),
             Effect.asVoid,
           ),
@@ -985,7 +1193,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       invalidate: (controller.invalidate ?? Effect.void).pipe(
         Effect.andThen(confirmedAuthentication.set(false)),
         Effect.andThen(clearLiveState),
-        Effect.andThen(liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache)),
+        Effect.andThen(invalidateAccountCaches),
         Effect.andThen(snapshot.refresh),
         Effect.asVoid,
       ),
@@ -1001,15 +1209,15 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       auth,
       snapshot: {
         ...snapshot,
-        refresh: snapshot.refresh.pipe(Effect.tap(() => controller.refreshMethods ?? Effect.void)),
+        refresh: invalidateFactoryUsageCache.pipe(
+          Effect.andThen(snapshot.refresh),
+          Effect.tap(() => controller.refreshMethods ?? Effect.void),
+        ),
       },
       invalidateCaches: (Option.isSome(runtimeCoordinator)
         ? runtimeCoordinator.value.clearLiveConfiguration(instanceId)
         : Effect.void
-      ).pipe(
-        Effect.andThen(clearLearnedModels),
-        Effect.andThen(liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache)),
-      ),
+      ).pipe(Effect.andThen(clearLearnedModels), Effect.andThen(invalidateAccountCaches)),
       orchestrationAdapter,
       textGeneration: makeUnsupportedTextGeneration(),
       acpSessionManagement: {
@@ -1054,7 +1262,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
               baseUrl,
               ...(headers === undefined ? {} : { headers }),
             }),
-          ).pipe(Effect.tap(() => liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache))),
+          ).pipe(Effect.tap(() => invalidateAccountCaches)),
         disableProvider: ({ cwd, providerId }) =>
           provideAcpManagementServices(
             disableAcpRegistryProvider({
@@ -1064,7 +1272,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
               environment: processEnvironment,
               providerId,
             }),
-          ).pipe(Effect.tap(() => liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache))),
+          ).pipe(Effect.tap(() => invalidateAccountCaches)),
         logout: (cwd) => {
           const logout = logoutAcpRegistry({
             instanceId,
@@ -1077,19 +1285,17 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             Effect.provideService(SecureRandom.SecureRandom, random),
             Effect.tap(() => confirmedAuthentication.set(false)),
             Effect.tap(() =>
-              liveSnapshotSemaphore.withPermit(
-                invalidateEnrichmentCache.pipe(
-                  Effect.andThen(
-                    Option.isSome(runtimeCoordinator)
-                      ? Effect.all(
-                          [
-                            runtimeCoordinator.value.clearAvailableCommands(instanceId),
-                            runtimeCoordinator.value.clearLiveConfiguration(instanceId),
-                          ],
-                          { concurrency: "unbounded", discard: true },
-                        )
-                      : Effect.void,
-                  ),
+              invalidateAccountCaches.pipe(
+                Effect.andThen(
+                  Option.isSome(runtimeCoordinator)
+                    ? Effect.all(
+                        [
+                          runtimeCoordinator.value.clearAvailableCommands(instanceId),
+                          runtimeCoordinator.value.clearLiveConfiguration(instanceId),
+                        ],
+                        { concurrency: "unbounded", discard: true },
+                      )
+                    : Effect.void,
                 ),
               ),
             ),

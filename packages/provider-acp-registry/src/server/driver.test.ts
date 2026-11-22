@@ -9,9 +9,11 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { toCustomModelSetting } from "@t3tools/shared/model";
 import { AcpRegistrySettings } from "../settings.ts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -20,6 +22,9 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
@@ -959,7 +964,7 @@ const driverLayer = TestProviderHost.layer({ runBackgroundWork: false }).pipe(
       ProviderEventLoggers.NoOpProviderEventLoggers,
     ),
   ),
-  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer, FetchHttpClient.layer)),
 );
 
 it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) => {
@@ -1186,6 +1191,312 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
       expect(effortBySlug(yield* instance.snapshot.getSnapshot)).toBe(
         "model-a:effort,model-b:effort",
       );
+    }),
+  );
+
+  it.effect(
+    "publishes ordered Factory Droid limits via applyUsageLimits and keeps last known bars on refresh error",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "acp-droid-" });
+        const agentPath = path.join(directory, "agent.mjs");
+        const modelsPath = path.join(directory, "models.json");
+        yield* fileSystem.writeFileString(agentPath, fakeAgentSource);
+        yield* fileSystem.writeFileString(modelsPath, JSON.stringify(["claude-opus-4-6"]));
+        yield* fileSystem.writeFileString(
+          path.join(directory, "auth.json"),
+          JSON.stringify({ access_token: "good-tok", active_organization_id: "org_1" }),
+        );
+
+        let mode: "initial" | "error" | "updated" = "initial";
+        const errorProbeCalled = yield* Deferred.make<void>();
+        const mockHttpClient = HttpClient.make((request, url) => {
+          if (url.pathname === "/api/billing/limits") {
+            if (mode === "error") {
+              return Deferred.succeed(errorProbeCalled, undefined).pipe(
+                Effect.ignore,
+                Effect.as(HttpClientResponse.fromWeb(request, new Response(null, { status: 500 }))),
+              );
+            }
+            const core5hPercent = mode === "updated" ? 55 : 30;
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  usesTokenRateLimitsBilling: true,
+                  hasActiveSubscription: true,
+                  overagePreference: "droidCore",
+                  limits: {
+                    standard: {
+                      fiveHour: { usedPercent: 10, secondsRemaining: 3_600 },
+                      weekly: { usedPercent: 100, secondsRemaining: 72_000 },
+                    },
+                    core: {
+                      fiveHour: { usedPercent: core5hPercent, secondsRemaining: 9_600 },
+                    },
+                  },
+                }),
+              ),
+            );
+          }
+          if (url.pathname === "/api/app/auth/me") {
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({
+                  organization: {
+                    id: "org_1",
+                    subscription: {
+                      orbSubscription: { plan: { name: "Factory Pro Annual Plan" } },
+                    },
+                  },
+                  userProfile: {
+                    email: "dev@example.com",
+                    workosUser: { id: "user_1", email: "dev@example.com" },
+                  },
+                }),
+              ),
+            );
+          }
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, new Response(null, { status: 404 })),
+          );
+        });
+
+        const instance = yield* AcpRegistryDriver.create({
+          instanceId: identity.instanceId,
+          displayName: "Factory Droid",
+          enabled: true,
+          environment: [
+            { name: "FACTORY_HOME", value: directory, sensitive: false },
+            { name: "FACTORY_DISABLE_KEYRING", value: "1", sensitive: false },
+          ],
+          config: decodeSettings({ agentId: "factory-droid" }),
+        }).pipe(
+          Effect.provideService(HttpClient.HttpClient, mockHttpClient),
+          Effect.provideService(HostProcess.Environment, {}),
+          Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+            ...catalogWithInspection({
+              status: "ready",
+              agentId: "factory-droid",
+              version: "1.0.0",
+              distribution: "npx",
+            }),
+            resolve: () =>
+              Effect.succeed({
+                distribution: "npx" as const,
+                spawn: { command: process.execPath, args: [agentPath, modelsPath] },
+              }),
+          }),
+        );
+
+        const initialReady = yield* instance.snapshot.streamChanges.pipe(
+          Stream.filter(
+            (snapshot) =>
+              snapshot.status === "ready" &&
+              (snapshot.usageLimits?.windows.length ?? 0) === 3 &&
+              snapshot.auth.status === "authenticated",
+          ),
+          Stream.runHead,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* instance.snapshot.refresh;
+        const firstSnapshot = Option.getOrThrow(yield* Fiber.join(initialReady));
+        expect(firstSnapshot.usageLimits?.windows.map((w) => w.id)).toEqual([
+          "standard-5h",
+          "standard-weekly",
+          "core-5h",
+        ]);
+        expect(firstSnapshot.usageLimits?.group).toEqual({
+          id: "acpRegistry:factory-droid",
+          label: "Factory Droid",
+        });
+        expect(firstSnapshot.auth.email).toBe("dev@example.com");
+        expect(firstSnapshot.auth.label).toBe("Factory Pro Annual Plan");
+        expect(firstSnapshot.auth.workspaceId).toBe("org_1");
+
+        // A transient HTTP 500 during refreshUsage keeps the previously published bars and plan.
+        mode = "error";
+        yield* instance.snapshot.refreshUsage!;
+        yield* Deferred.await(errorProbeCalled);
+        yield* Effect.yieldNow;
+        const afterError = yield* instance.snapshot.getSnapshot;
+        expect(afterError.usageLimits?.windows.map((w) => [w.id, w.usedPercent])).toEqual([
+          ["standard-5h", 10],
+          ["standard-weekly", 100],
+          ["core-5h", 30],
+        ]);
+        expect(afterError.auth.label).toBe("Factory Pro Annual Plan");
+
+        // Next refresh recovers cleanly with updated values.
+        mode = "updated";
+        const updatedStream = yield* instance.snapshot.streamChanges.pipe(
+          Stream.filter((snapshot) =>
+            Boolean(
+              snapshot.usageLimits?.windows.some((w) => w.id === "core-5h" && w.usedPercent === 55),
+            ),
+          ),
+          Stream.runHead,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* instance.snapshot.refreshUsage!;
+        expect(Option.isSome(yield* Fiber.join(updatedStream))).toBe(true);
+      }),
+  );
+
+  it.effect("retries Factory limits once after ACP probe refreshes an expired token", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "acp-droid-retry-" });
+      const agentPath = path.join(directory, "refreshing-agent.mjs");
+      const modelsPath = path.join(directory, "models.json");
+      const authPath = path.join(directory, "auth.json");
+      yield* fileSystem.writeFileString(modelsPath, JSON.stringify(["claude-opus-4-6"]));
+      yield* fileSystem.writeFileString(authPath, JSON.stringify({ access_token: "expired-tok" }));
+      yield* fileSystem.writeFileString(
+        agentPath,
+        `
+import { readFileSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const { id, method } = JSON.parse(line);
+  if (id === undefined) return;
+  if (method === "initialize") {
+    send({ id, result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [] } });
+  } else if (method === "session/new") {
+    writeFileSync(process.argv[3], JSON.stringify({ access_token: "refreshed-tok" }));
+    const modelIds = JSON.parse(readFileSync(process.argv[2], "utf8"));
+    send({
+      id,
+      result: {
+        sessionId: "probe-session",
+        models: { currentModelId: modelIds[0], availableModels: modelIds.map((id) => ({ modelId: id, name: id })) },
+      },
+    });
+  } else {
+    send({ id, result: {} });
+  }
+});
+`,
+      );
+
+      let expiredCalls = 0;
+      const mockHttpClient = HttpClient.make((request, url) => {
+        if (request.headers.authorization === "Bearer expired-tok") {
+          expiredCalls += 1;
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, new Response(null, { status: 401 })),
+          );
+        }
+        if (url.pathname === "/api/billing/limits") {
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json({
+                usesTokenRateLimitsBilling: true,
+                limits: {
+                  standard: {
+                    weekly: { usedPercent: 25, secondsRemaining: 10_000 },
+                  },
+                },
+              }),
+            ),
+          );
+        }
+        return Effect.succeed(
+          HttpClientResponse.fromWeb(request, new Response(null, { status: 404 })),
+        );
+      });
+
+      const instance = yield* AcpRegistryDriver.create({
+        instanceId: identity.instanceId,
+        displayName: "Factory Droid",
+        enabled: true,
+        environment: [
+          { name: "FACTORY_HOME", value: directory, sensitive: false },
+          { name: "FACTORY_DISABLE_KEYRING", value: "1", sensitive: false },
+        ],
+        config: decodeSettings({ agentId: "factory-droid" }),
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, mockHttpClient),
+        Effect.provideService(HostProcess.Environment, {}),
+        Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+          ...catalogWithInspection({
+            status: "ready",
+            agentId: "factory-droid",
+            version: "1.0.0",
+            distribution: "npx",
+          }),
+          resolve: () =>
+            Effect.succeed({
+              distribution: "npx" as const,
+              spawn: { command: process.execPath, args: [agentPath, modelsPath, authPath] },
+            }),
+        }),
+      );
+
+      const recovered = yield* instance.snapshot.streamChanges.pipe(
+        Stream.filter(
+          (snapshot) =>
+            snapshot.usageLimits?.unavailable === undefined &&
+            snapshot.usageLimits?.windows.some((w) => w.usedPercent === 25) === true,
+        ),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* instance.snapshot.refresh;
+      expect(Option.isSome(yield* Fiber.join(recovered))).toBe(true);
+      expect(expiredCalls).toBeGreaterThanOrEqual(1);
+    }),
+  );
+
+  it.effect("does not probe Factory limits for non-Droid ACP Registry agents", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "acp-other-" });
+      const agentPath = path.join(directory, "agent.mjs");
+      const modelsPath = path.join(directory, "models.json");
+      yield* fileSystem.writeFileString(agentPath, fakeAgentSource);
+      yield* fileSystem.writeFileString(modelsPath, JSON.stringify(["other-model"]));
+
+      const failingHttpClient = HttpClient.make(() =>
+        Effect.die(new Error("Factory HTTP must not be called for non-Droid agents")),
+      );
+      const instance = yield* AcpRegistryDriver.create({
+        instanceId: identity.instanceId,
+        displayName: "Other Agent",
+        enabled: true,
+        environment: [],
+        config: decodeSettings({ agentId: "other-agent" }),
+      }).pipe(
+        Effect.provideService(HttpClient.HttpClient, failingHttpClient),
+        Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+          ...catalogWithInspection({
+            status: "ready",
+            agentId: "other-agent",
+            version: "1.0.0",
+            distribution: "npx",
+          }),
+          resolve: () =>
+            Effect.succeed({
+              distribution: "npx" as const,
+              spawn: { command: process.execPath, args: [agentPath, modelsPath] },
+            }),
+        }),
+      );
+      const ready = yield* instance.snapshot.streamChanges.pipe(
+        Stream.filter((snapshot) => snapshot.status === "ready"),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* instance.snapshot.refresh;
+      const snapshot = Option.getOrThrow(yield* Fiber.join(ready));
+      expect(snapshot.usageLimits).toBeUndefined();
     }),
   );
 });

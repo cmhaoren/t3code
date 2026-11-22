@@ -19,6 +19,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as ProviderHost from "./ProviderHost.ts";
 import {
   applyUsageLimitsUpdate,
+  clampPercent,
   makeUsageLimits,
   resolveUsageLimitsAfterProbe,
 } from "./usageLimits.ts";
@@ -262,24 +263,81 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   const applyUsageLimits: ManagedServerProvider["applyUsageLimits"] = Effect.fnUntraced(
     function* (update) {
       const snapshotToPublish = yield* Ref.modify(snapshotStateRef, (state) => {
-        const complete = update.complete && update.windows.length > 0;
+        const complete =
+          update.complete === true &&
+          (update.windows.length > 0 || update.unavailable !== undefined);
+        const probed: ServerProvider["usageLimits"] = complete
+          ? {
+              ...(update.preserveWindowOrder === true
+                ? {
+                    checkedAt: update.checkedAt,
+                    windows: update.windows.map((window) => ({
+                      ...window,
+                      usedPercent: clampPercent(window.usedPercent),
+                    })),
+                  }
+                : makeUsageLimits(update)),
+              ...(update.group === undefined ? {} : { group: update.group }),
+              ...(update.externalUsage === undefined
+                ? {}
+                : { externalUsage: update.externalUsage }),
+              ...(update.unavailable === undefined ? {} : { unavailable: update.unavailable }),
+              ...(update.credentialFingerprint === undefined
+                ? {}
+                : { credentialFingerprint: update.credentialFingerprint }),
+            }
+          : undefined;
         const usageLimits = complete
-          ? makeUsageLimits(update)
+          ? resolveUsageLimitsAfterProbe({
+              published: state.snapshot.usageLimits,
+              probed,
+            })
           : applyUsageLimitsUpdate({
               previous: state.snapshot.usageLimits,
               update,
               checkedAt: update.checkedAt,
             });
+        const retainedPrevious = complete && usageLimits === state.snapshot.usageLimits;
         const { auth } = state.snapshot;
         const label = update.windows.length > 0 ? update.authLabel : undefined;
         const relabel =
+          !retainedPrevious &&
           (label !== undefined || (complete && state.usageAuthLabel !== undefined)) &&
           label !== auth.label;
-        if (usageLimits === state.snapshot.usageLimits && !relabel) {
+        const email =
+          !retainedPrevious && update.authEmail !== undefined && update.authEmail !== auth.email
+            ? update.authEmail
+            : undefined;
+        const workspaceId =
+          !retainedPrevious &&
+          update.authWorkspaceId !== undefined &&
+          update.authWorkspaceId !== auth.workspaceId
+            ? update.authWorkspaceId
+            : undefined;
+        const status =
+          !retainedPrevious &&
+          update.authStatus === "authenticated" &&
+          auth.status === "unknown" &&
+          !usageLimits?.unavailable &&
+          state.snapshot.enabled &&
+          state.snapshot.installed
+            ? ("authenticated" as const)
+            : undefined;
+        const nextAuth =
+          relabel || email !== undefined || workspaceId !== undefined || status !== undefined
+            ? {
+                ...auth,
+                ...(relabel ? { label } : {}),
+                ...(email !== undefined ? { email } : {}),
+                ...(workspaceId !== undefined ? { workspaceId } : {}),
+                ...(status !== undefined ? { status } : {}),
+              }
+            : auth;
+        if (usageLimits === state.snapshot.usageLimits && nextAuth === auth) {
           return [null, state] as const;
         }
         const snapshot = withUsageLimits(
-          relabel ? { ...state.snapshot, auth: { ...auth, label } } : state.snapshot,
+          nextAuth === auth ? state.snapshot : { ...state.snapshot, auth: nextAuth },
           usageLimits,
         );
         return [
@@ -287,7 +345,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
           {
             ...state,
             snapshot,
-            usageAuthLabel: label ?? (complete ? null : state.usageAuthLabel),
+            usageAuthLabel: retainedPrevious
+              ? state.usageAuthLabel
+              : (label ?? (complete ? null : state.usageAuthLabel)),
           },
         ] as const;
       });

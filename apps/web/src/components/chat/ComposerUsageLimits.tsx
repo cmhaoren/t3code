@@ -16,7 +16,10 @@ import type { ComposerBannerStackItem } from "./ComposerBannerStack";
 
 function accountLabel(account: UsageLimitsReport["accounts"][number]): string {
   if (!account.instanceId) return account.label;
-  const driver = providerClients.get(account.driver)?.label ?? String(account.driver);
+  const driver =
+    account.limits.group?.label ??
+    providerClients.get(account.driver)?.label ??
+    String(account.driver);
   const instance =
     account.displayName?.trim() ||
     (String(account.instanceId) !== String(account.driver) ? account.instanceId : "");

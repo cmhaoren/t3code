@@ -104,6 +104,33 @@ describe("applyUsageLimitsUpdate", () => {
       zeroSpendCap: true,
     });
   });
+
+  it("preserves group metadata and detects blocksModel changes", () => {
+    const group = { id: "acpRegistry:factory-droid", label: "Factory Droid" };
+    const grouped = {
+      checkedAt,
+      windows: [{ ...session }],
+      group,
+    };
+    const updated = applyUsageLimitsUpdate({
+      previous: grouped,
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      update: { windows: [{ ...session, blocksModel: false }] },
+    });
+    expect(updated).not.toBe(grouped);
+    expect(updated).toEqual({
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      windows: [{ ...session, blocksModel: false }],
+      group,
+    });
+    expect(
+      applyUsageLimitsUpdate({
+        previous: updated,
+        checkedAt: "2026-09-03T12:00:10.000Z",
+        update: { windows: [{ ...session, blocksModel: false }] },
+      }),
+    ).toBe(updated);
+  });
 });
 
 describe("resolveUsageLimitsAfterProbe", () => {

@@ -175,6 +175,11 @@ or endpoint configurations do not report subscription limits.
 Muse Code reports its session and weekly windows and its tier once the Muse CLI has run in a thread.
 Until then it shows no limits. Readings are not kept across a server restart.
 
+Factory Droid (configured through ACP Registry or a local `droid` executable) reports its 5-hour,
+weekly, and monthly Standard and Core windows, or its legacy Standard and Premium monthly allowance,
+using `FACTORY_API_KEY` or your local Droid CLI login without refreshing stored session tokens, and
+links directly to Factory billing settings.
+
 API-key accounts may not report subscription limits. This also applies to Claude connections
 using a proxy through `ANTHROPIC_AUTH_TOKEN`.
 

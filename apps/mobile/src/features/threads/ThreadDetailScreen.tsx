@@ -1788,6 +1788,7 @@ function ThreadDetailBody(
                       >
                         <ComposerUsageLimits
                           report={usageLimitsReport}
+                          providers={props.serverConfig?.providers}
                           environmentId={props.environmentId}
                           maxHeight={usageLimitsMaxHeight}
                           onClose={dismissUsageLimits}

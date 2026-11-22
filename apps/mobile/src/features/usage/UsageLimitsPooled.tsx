@@ -42,7 +42,11 @@ const PACE_LABEL = {
 
 function accountName(account: LimitAccount, resolve: MessageResolver) {
   if (account.displayName) return account.displayName;
-  if (!account.email) return providerClients.get(account.driver)?.label ?? account.driver;
+  if (!account.email) {
+    return (
+      account.limits.group?.label ?? providerClients.get(account.driver)?.label ?? account.driver
+    );
+  }
   return (
     emailInitials(account.email) || resolve(msg("Account", { $context: "fallback account name" }))
   );
@@ -501,14 +505,16 @@ export function UsageLimitsSection({
       ) : null}
       {pools.map((pool) => {
         const windows = displayLimitWindows(pool);
+        const poolLabel =
+          pool.accounts[0]?.limits.group?.label ??
+          providerClients.get(pool.driver)?.label ??
+          pool.title;
         return (
-          <Fragment key={pool.driver}>
+          <Fragment key={pool.id}>
             <View className="gap-3">
               <View className="flex-row items-center gap-2 px-1">
-                <ProviderIcon provider={pool.driver} size={18} />
-                <Text className="text-base font-t3-medium text-foreground">
-                  {providerClients.get(pool.driver)?.label ?? pool.driver}
-                </Text>
+                <ProviderIcon provider={pool.driver} iconUrl={pool.iconUrl} size={18} />
+                <Text className="text-base font-t3-medium text-foreground">{poolLabel}</Text>
               </View>
               {windows.map((window) => {
                 const details =
@@ -606,7 +612,7 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
   const accounts = collectLimitAccounts(selected);
   const account = accounts.find((candidate) => candidate.key === accountKey);
   const pool = collectLimitPools(accounts, now)
-    .find((candidate) => candidate.driver === account?.driver)
+    .find((candidate) => candidate.accounts.some((member) => member.key === accountKey))
     ?.windows.find((candidate) => candidate.id === windowId && candidate.kind === windowKind);
   const window = pool?.members.find((member) => member.account.key === accountKey)?.window;
   const evenPace = window ? paceRemainingPercent(window, now) : null;
@@ -628,9 +634,10 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
           <>
             <View className="gap-2">
               <View className="flex-row items-center gap-2">
-                <ProviderIcon provider={account.driver} size={24} />
+                <ProviderIcon provider={account.driver} iconUrl={account.iconUrl} size={24} />
                 <Text className="flex-1 text-xl font-t3-bold text-foreground">
                   {account.displayName ??
+                    account.limits.group?.label ??
                     providerClients.get(account.driver)?.label ??
                     account.driver}
                 </Text>

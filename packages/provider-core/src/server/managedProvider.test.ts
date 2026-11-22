@@ -1030,4 +1030,102 @@ describe("makeManagedServerProvider", () => {
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
   );
+
+  it.effect(
+    "applies ordered grouped limits with auth metadata and keeps last known bars on probeFailed",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const unknownSnapshot: ServerProvider = {
+            ...refreshedSnapshot,
+            auth: { status: "unknown" },
+          };
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Effect.succeed(unknownSnapshot),
+            refreshOnInterval: false,
+          });
+          yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
+
+          const group = { id: "acpRegistry:factory-droid", label: "Factory Droid" } as const;
+          const externalUsage = {
+            label: "Factory usage",
+            url: "https://app.factory.ai/settings/billing",
+          } as const;
+          const orderedWindows = [
+            {
+              id: "standard-weekly",
+              kind: "weekly",
+              label: "Standard · Weekly",
+              usedPercent: 100,
+              blocksModel: false,
+            },
+            {
+              id: "core-5h",
+              kind: "session",
+              label: "Core · 5h",
+              usedPercent: 30,
+              blocksModel: false,
+            },
+          ] as const;
+
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:02.000Z",
+            complete: true,
+            preserveWindowOrder: true,
+            windows: [...orderedWindows],
+            group,
+            externalUsage,
+            credentialFingerprint: "abc123",
+            authLabel: "Factory Pro Annual Plan",
+            authEmail: "dev@example.com",
+            authWorkspaceId: "org_1",
+            authStatus: "authenticated",
+          });
+
+          const published = yield* provider.getSnapshot;
+          assert.deepStrictEqual(
+            published.usageLimits?.windows.map((w) => w.id),
+            ["standard-weekly", "core-5h"],
+          );
+          assert.deepStrictEqual(published.usageLimits?.group, group);
+          assert.deepStrictEqual(published.usageLimits?.externalUsage, externalUsage);
+          assert.strictEqual(published.usageLimits?.credentialFingerprint, "abc123");
+          assert.strictEqual(published.auth.status, "authenticated");
+          assert.strictEqual(published.auth.email, "dev@example.com");
+          assert.strictEqual(published.auth.workspaceId, "org_1");
+          assert.strictEqual(published.auth.label, "Factory Pro Annual Plan");
+
+          // Subsequent transient failure preserves last known windows and auth metadata.
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:05.000Z",
+            complete: true,
+            windows: [],
+            group,
+            externalUsage,
+            unavailable: { reason: "probeFailed", message: "Factory HTTP 500" },
+          });
+          assert.deepStrictEqual(yield* provider.getSnapshot, published);
+
+          // Unsupported clears the previous bars.
+          yield* provider.applyUsageLimits({
+            checkedAt: "2026-04-10T00:00:06.000Z",
+            complete: true,
+            windows: [],
+            group,
+            externalUsage,
+            unavailable: { reason: "unsupported", message: "Sign in to Factory Droid." },
+          });
+          assert.strictEqual(
+            (yield* provider.getSnapshot).usageLimits?.unavailable?.reason,
+            "unsupported",
+          );
+          assert.strictEqual((yield* provider.getSnapshot).auth.label, undefined);
+        }),
+      ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
 });

@@ -144,4 +144,21 @@ describe("resolveThreadDetailsLimits", () => {
       rows: [{ label: "Session", left: 70, accounts: 1, from: { hubs: ["Hub"], signedIn: false } }],
     });
   });
+
+  it("does not fall back to ungrouped hubs for a grouped provider instance", () => {
+    const grouped: ServerProvider = {
+      ...claudeInstance({
+        checkedAt,
+        windows: [],
+        group: { id: "acpRegistry:factory-droid", label: "Factory Droid" },
+        unavailable: { reason: "probeFailed" },
+      }),
+      driver: ProviderDriverKind.make("acpRegistry"),
+    };
+    const acpHub = hub("Hub", [{ id: "acp.json", driver: grouped.driver, limits: limitsAt(10) }]);
+    expect(resolveThreadDetailsLimits(instanceId, null, [grouped], [acpHub], now)).toEqual({
+      kind: "instance",
+      limits: grouped.usageLimits,
+    });
+  });
 });

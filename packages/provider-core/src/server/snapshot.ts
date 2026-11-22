@@ -1,6 +1,7 @@
 import type {
   ProviderUsageLimitsUpdate,
   ServerProvider,
+  ServerProviderUsageLimits,
   ServerSettingsError,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
@@ -11,8 +12,18 @@ import type { ProviderMaintenanceCapabilities } from "./maintenance.ts";
 export type ProviderUsageLimitsReport = ProviderUsageLimitsUpdate & {
   readonly checkedAt: string;
   readonly authLabel?: string;
+  readonly authEmail?: string;
+  readonly authWorkspaceId?: string;
+  readonly authStatus?: ServerProvider["auth"]["status"];
+  /** Keep caller-supplied window order rather than sorting lexicographically within a kind. */
+  readonly preserveWindowOrder?: boolean;
   /** A full reading replaces sparse windows and clears a previous probe failure. */
   readonly complete?: boolean;
+  /** Only a complete reading carries these; with no windows it publishes why limits are unavailable. */
+  readonly group?: ServerProviderUsageLimits["group"];
+  readonly externalUsage?: ServerProviderUsageLimits["externalUsage"];
+  readonly unavailable?: ServerProviderUsageLimits["unavailable"];
+  readonly credentialFingerprint?: ServerProviderUsageLimits["credentialFingerprint"];
 };
 
 export interface ManagedServerProvider {
@@ -26,6 +37,6 @@ export interface ManagedServerProvider {
   readonly refresh: Effect.Effect<ServerProvider>;
   readonly refreshUsage?: Effect.Effect<void, ServerSettingsError>;
   readonly streamChanges: Stream.Stream<ServerProvider>;
-  /** Merge windows by ID and set any authLabel; an update with no window leaves the snapshot untouched. */
+  /** Merge windows by ID and set any authLabel; an incomplete update with no window leaves the snapshot untouched. */
   readonly applyUsageLimits: (update: ProviderUsageLimitsReport) => Effect.Effect<void>;
 }
