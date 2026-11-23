@@ -268,8 +268,11 @@ function resolveFactoryDir(
     return path.resolve(expandHomePath(configured, homeDirectory));
   }
   const home =
-    nonEmptyString(environment.HOME) ?? nonEmptyString(environment.USERPROFILE) ?? homeDirectory;
-  return path.join(home, ".factory");
+    nonEmptyString(environment.FACTORY_HOME_OVERRIDE) ??
+    nonEmptyString(environment.HOME) ??
+    nonEmptyString(environment.USERPROFILE) ??
+    homeDirectory;
+  return path.join(path.resolve(expandHomePath(home, homeDirectory)), ".factory");
 }
 
 function parseEnvApiKey(content: string): string | undefined {

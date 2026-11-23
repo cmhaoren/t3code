@@ -222,6 +222,73 @@ describe("resolveFactoryCredentials", () => {
         });
       }),
     );
+
+    it.effect(
+      "supports FACTORY_HOME_OVERRIDE (with ~/ expansion) below explicit FACTORY_HOME",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "factory-home-override-" });
+          const key = NodeCrypto.randomBytes(32);
+          const keyB64 = key.toString("base64");
+
+          const writeAuthFile = (factoryDir: string, token: string, orgId: string) =>
+            Effect.gen(function* () {
+              yield* fs.makeDirectory(factoryDir, { recursive: true });
+              yield* fs.writeFileString(
+                path.join(factoryDir, "auth.v2.file"),
+                encryptFactoryPayload({ access_token: token, active_organization_id: orgId }, key),
+              );
+              yield* fs.writeFileString(path.join(factoryDir, "auth.v2.key"), keyB64);
+            });
+
+          const defaultHome = path.join(root, "default-home");
+          const overrideHome = path.join(root, "profile");
+          const directFactoryHome = path.join(root, "direct");
+          yield* writeAuthFile(path.join(defaultHome, ".factory"), "default-tok", "org-default");
+          yield* writeAuthFile(path.join(overrideHome, ".factory"), "override-tok", "org-override");
+          yield* writeAuthFile(directFactoryHome, "direct-tok", "org-direct");
+
+          expect(
+            yield* resolveFactoryCredentials({
+              FACTORY_HOME_OVERRIDE: overrideHome,
+              FACTORY_DISABLE_KEYRING: "1",
+              HOME: defaultHome,
+              USERPROFILE: defaultHome,
+            }),
+          ).toEqual({
+            token: "override-tok",
+            source: "file",
+            activeOrganizationId: "org-override",
+          });
+
+          expect(
+            yield* resolveFactoryCredentials({
+              FACTORY_HOME_OVERRIDE: "~/profile",
+              FACTORY_DISABLE_KEYRING: "1",
+              HOME: defaultHome,
+              USERPROFILE: defaultHome,
+            }).pipe(Effect.provideService(HostProcess.HomeDirectory, root)),
+          ).toEqual({
+            token: "override-tok",
+            source: "file",
+            activeOrganizationId: "org-override",
+          });
+
+          expect(
+            yield* resolveFactoryCredentials({
+              FACTORY_HOME: directFactoryHome,
+              FACTORY_HOME_OVERRIDE: overrideHome,
+              FACTORY_DISABLE_KEYRING: "1",
+            }),
+          ).toEqual({
+            token: "direct-tok",
+            source: "file",
+            activeOrganizationId: "org-direct",
+          });
+        }),
+    );
   });
 });
 
