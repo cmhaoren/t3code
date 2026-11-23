@@ -200,6 +200,13 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       staleTimeMs: 0,
       idleTtlMs: 0,
     }),
+    // Whole-thread counters read from persisted records; the composer re-reads them on mount.
+    threadSessionStats: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:thread-session-stats",
+      tag: ORCHESTRATION_V2_WS_METHODS.getThreadSessionStats,
+      staleTimeMs: 2_000,
+      idleTtlMs: 30_000,
+    }),
     stopWorkflow: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:orchestration:stop-workflow",
       tag: ORCHESTRATION_V2_WS_METHODS.stopWorkflow,

@@ -10,6 +10,10 @@ import {
   devinAnswerablePermissionOptions,
 } from "./devinAcp.ts";
 import { extractDroidElicitationForm } from "./droidAcp.ts";
+import {
+  diffDroidSessionUsageToTurnTokenUsage,
+  readDroidSessionUsage,
+} from "./droidSessionUsage.ts";
 import { makeKimiPromptOutcomeWatch } from "./kimiAcp.ts";
 import { extractOmpElicitationForm } from "./ompAcp.ts";
 import { extractOpenCodeElicitationForm } from "./opencodeAcp.ts";
@@ -190,6 +194,8 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
   options: AcpRegistryAdapterV2Options,
 ) {
   const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const runtimeCoordinator = Option.getOrUndefined(
     yield* Effect.serviceOption(AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator),
   );
@@ -299,6 +305,36 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
                 ),
             ),
         }),
+    // Droid's prompt response carries no usage; its session settings file does.
+    ...(isDroid
+      ? {
+          watchTurnTokenUsage: (input: { readonly sessionId: string; readonly cwd: string }) =>
+            readDroidSessionUsage({
+              sessionId: input.sessionId,
+              cwd: input.cwd,
+              environment: options.environment,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.catchCause(() => Effect.succeed(null)),
+              Effect.map(
+                (before) => (settle) =>
+                  readDroidSessionUsage({
+                    sessionId: input.sessionId,
+                    cwd: input.cwd,
+                    environment: options.environment,
+                  }).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    Effect.provideService(Path.Path, path),
+                    Effect.catchCause(() => Effect.succeed(null)),
+                    Effect.map((after) =>
+                      diffDroidSessionUsageToTurnTokenUsage(before, after, settle),
+                    ),
+                  ),
+              ),
+            ),
+        }
+      : {}),
     ...(isVibe ? { registerExtensions: registerMistralVibeAcpExtensions } : {}),
     ...(isClaude
       ? {

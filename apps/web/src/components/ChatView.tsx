@@ -355,6 +355,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
 import { ComposerSurface } from "./chat/ComposerSurface";
+import { ThreadSessionStatsBarHost } from "./chat/ComposerSessionStatsBar";
 import { resolveThreadSyncPhase } from "../threadSync";
 import { hasAvailableCompactionProvider } from "./chat/compaction.logic";
 import {
@@ -1875,6 +1876,9 @@ export default function ChatView(props: ChatViewProps) {
       isGitRepo,
       showEnvironmentIndicator: showComposerEnvironmentIndicator,
     });
+  // Only a persisted server thread has counters to read; a draft or the
+  // read-only subagent bar has no thread of its own.
+  const showSessionStatsBar = !embedded && isServerThread && !showProviderSubagentBar;
   const terminalShortcutLabelOptions = {
     context: {
       terminalFocus: true,
@@ -3760,7 +3764,9 @@ export default function ChatView(props: ChatViewProps) {
                   >
                     <ChildThreadApprovals threadRef={activeThreadRef} />
                     <div className="relative">
-                      <ComposerSurface.Shell contextRow={showComposerContextStrip}>
+                      <ComposerSurface.Shell
+                        contextRow={showComposerContextStrip || showSessionStatsBar}
+                      >
                         <ComposerSurface.Host
                           inert={queuedRunEdit.isSaving}
                           aria-busy={queuedRunEdit.isSaving}
@@ -4015,6 +4021,16 @@ export default function ChatView(props: ChatViewProps) {
                                 />
                               </div>
                             )}
+                            {showSessionStatsBar ? (
+                              <div className="pointer-events-auto">
+                                <ThreadSessionStatsBarHost
+                                  environmentId={activeThread.environmentId}
+                                  isWorking={isWorking}
+                                  liveContextWindow={activeContextWindow}
+                                  threadId={activeThread.id}
+                                />
+                              </div>
+                            ) : null}
                           </div>
                         </div>
                       </ComposerSurface.Shell>

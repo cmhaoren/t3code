@@ -26,6 +26,14 @@
     "./server/AcpRegistryRuntimeCoordinator": {
       "types": "./src/server/AcpRegistryRuntimeCoordinator.ts",
       "import": "./src/server/AcpRegistryRuntimeCoordinator.ts"
+    },
+    "./server/droidSessionUsage": {
+      "types": "./src/server/droidSessionUsage.ts",
+      "import": "./src/server/droidSessionUsage.ts"
+    },
+    "./server/factoryUsageLimits": {
+      "types": "./src/server/factoryUsageLimits.ts",
+      "import": "./src/server/factoryUsageLimits.ts"
     }
   },
   "scripts": {

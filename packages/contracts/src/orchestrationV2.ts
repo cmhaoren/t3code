@@ -4027,6 +4027,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getThreadProjection: "orchestration.getThreadProjection",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getNativeChildWork: "orchestration.getNativeChildWork",
+  getThreadSessionStats: "orchestration.getThreadSessionStats",
   stopWorkflow: "orchestration.stopWorkflow",
   forceStopThread: "orchestration.forceStopThread",
   getTurnItem: "orchestration.getTurnItem",
@@ -4549,6 +4550,65 @@ export class OrchestrationV2GetNativeChildWorkError extends Schema.TaggedError<O
   }
 }
 
+export const OrchestrationV2GetThreadSessionStatsInput = Schema.Struct({
+  threadId: ThreadId,
+});
+export type OrchestrationV2GetThreadSessionStatsInput =
+  typeof OrchestrationV2GetThreadSessionStatsInput.Type;
+
+/** Cumulative token totals for one thread, including cache traffic and the hit rate they imply. */
+export const OrchestrationV2ThreadSessionTokenUsage = Schema.Struct({
+  uncachedInputTokens: NonNegativeInt,
+  cacheReadTokens: NonNegativeInt,
+  cacheWriteTokens: NonNegativeInt,
+  outputTokens: NonNegativeInt,
+  reasoningTokens: NonNegativeInt,
+  totalTokens: NonNegativeInt,
+  cacheHitPercent: Schema.NullOr(Schema.Number),
+});
+export type OrchestrationV2ThreadSessionTokenUsage =
+  typeof OrchestrationV2ThreadSessionTokenUsage.Type;
+
+/** A heuristic split of the active context window into its three largest segments. */
+export const OrchestrationV2ThreadSessionContextBreakdown = Schema.Struct({
+  systemAndToolsTokens: NonNegativeInt,
+  toolContextTokens: NonNegativeInt,
+  messageTokens: NonNegativeInt,
+  usedTokens: NonNegativeInt,
+  maxTokens: Schema.NullOr(PositiveInt),
+  autoCompactThreshold: Schema.NullOr(PositiveInt),
+});
+export type OrchestrationV2ThreadSessionContextBreakdown =
+  typeof OrchestrationV2ThreadSessionContextBreakdown.Type;
+
+export const OrchestrationV2GetThreadSessionStatsResult = Schema.Struct({
+  threadId: ThreadId,
+  turns: NonNegativeInt,
+  steps: NonNegativeInt,
+  llmDurationMs: NonNegativeInt,
+  toolDurationMs: NonNegativeInt,
+  decodeDurationMs: NonNegativeInt,
+  decodeOutputTokens: NonNegativeInt,
+  tokensPerSecond: Schema.NullOr(Schema.Number),
+  tokenUsage: Schema.NullOr(OrchestrationV2ThreadSessionTokenUsage),
+  contextBreakdown: Schema.NullOr(OrchestrationV2ThreadSessionContextBreakdown),
+  providersIncluded: Schema.Array(ProviderInstanceId),
+});
+export type OrchestrationV2GetThreadSessionStatsResult =
+  typeof OrchestrationV2GetThreadSessionStatsResult.Type;
+
+export class OrchestrationV2GetThreadSessionStatsError extends Schema.TaggedError<OrchestrationV2GetThreadSessionStatsError>()(
+  "OrchestrationV2GetThreadSessionStatsError",
+  {
+    threadId: ThreadId,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return "Failed to read the thread's session stats.";
+  }
+}
+
 const WORKFLOW_FILE_ERROR_MESSAGES = {
   "invalid-path": "Workflow files must be absolute paths with the expected extension.",
   "root-unavailable": "Workflow file root unavailable.",
@@ -4740,6 +4800,10 @@ export const OrchestrationV2RpcSchemas = {
   getNativeChildWork: {
     input: OrchestrationV2GetNativeChildWorkInput,
     output: OrchestrationV2GetNativeChildWorkResult,
+  },
+  getThreadSessionStats: {
+    input: OrchestrationV2GetThreadSessionStatsInput,
+    output: OrchestrationV2GetThreadSessionStatsResult,
   },
   getTurnItem: {
     input: OrchestrationV2GetTurnItemInput,

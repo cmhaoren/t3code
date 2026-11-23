@@ -258,7 +258,7 @@ function nonEmptyString(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function resolveFactoryDir(
+export function resolveFactoryDir(
   environment: NodeJS.ProcessEnv,
   homeDirectory: string,
   path: Path.Path,

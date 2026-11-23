@@ -399,6 +399,20 @@ export interface AcpAdapterV2Flavor {
   ) => Effect.Effect<
     (result: EffectAcpSchema.PromptResponse) => Effect.Effect<AcpPromptOutcomeFailure | undefined>
   >;
+  /**
+   * Runs before `session/prompt` for agents whose prompt response carries no usage,
+   * such as Factory Droid. The returned check reads the agent's own session totals
+   * when the turn settles; a read failure is ignored, never a turn failure.
+   */
+  readonly watchTurnTokenUsage?: (input: {
+    readonly sessionId: string;
+    readonly cwd: string;
+  }) => Effect.Effect<
+    (input: {
+      readonly hasSubagents: boolean;
+      readonly terminalStatus: OrchestrationV2ProviderTurn["status"];
+    }) => Effect.Effect<TurnTokenUsage | undefined>
+  >;
   readonly requiresSignIn?: (cause: unknown) => boolean;
   /**
    * Runs before attachment paths, T3 instructions and native slash-command detection,
@@ -1727,6 +1741,15 @@ interface ActiveAcpTurn {
   /** Completed when an update after dispatch matches `cancelAfterPromptStarts.isStart`. */
   readonly promptStarted: Deferred.Deferred<void, never>;
   promptUsage: EffectAcpSchema.Usage | undefined;
+  /** Reads the agent's own session totals when per-turn prompt usage is unavailable. */
+  checkTurnTokenUsage:
+    | ((input: {
+        readonly hasSubagents: boolean;
+        readonly terminalStatus: OrchestrationV2ProviderTurn["status"];
+      }) => Effect.Effect<TurnTokenUsage | undefined>)
+    | undefined;
+  /** Session-ledger usage resolved at settle time; the terminal payload only reads it. */
+  resolvedTurnTokenUsage: TurnTokenUsage | undefined;
   backgroundFinalizeGeneration: number;
   /** `replyEndsWithUsageUpdate`: output arrived and its closing `usage_update` has not. */
   replyOpen: boolean;
@@ -8435,32 +8458,42 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           context: ActiveAcpTurn,
           status: OrchestrationV2ProviderTurn["status"],
           completedAt: DateTime.Utc | null,
-        ): OrchestrationV2ProviderTurn => ({
-          id: context.providerTurnId,
-          providerThreadId: context.input.providerThread.id,
-          nodeId: context.input.rootNodeId,
-          runAttemptId: context.input.attemptId,
-          nativeTurnRef:
-            context.nativePromptId === undefined
-              ? { driver, nativeId: context.nativeTurnId, strength: "weak" }
-              : { driver, nativeId: context.nativePromptId, strength: "strong" },
-          ordinal: context.input.providerTurnOrdinal,
-          status,
-          startedAt: context.startedAt,
-          completedAt,
-          ...(status === "running" || status === "pending"
-            ? {}
-            : {
-                // The prompt tap only captures usage for flavors that declared
-                // per-turn counters, so undeclared agents stay unavailable here.
-                turnTokenUsage: acpPerTurnPromptUsage(
+        ): OrchestrationV2ProviderTurn => {
+          // The prompt tap only captures usage for flavors that declared per-turn
+          // counters. When it leaves usage unavailable, a settled turn may have
+          // resolved the agent's own session ledger instead.
+          const promptUsage =
+            status === "running" || status === "pending"
+              ? undefined
+              : acpPerTurnPromptUsage(
                   context.promptUsage,
                   context.subagents.size > 0,
                   status,
                   flavor.geminiPromptUsage,
-                ),
-              }),
-        });
+                );
+          const turnTokenUsage =
+            promptUsage === undefined
+              ? undefined
+              : promptUsage.usageStatus === "unavailable" &&
+                  context.resolvedTurnTokenUsage !== undefined
+                ? context.resolvedTurnTokenUsage
+                : promptUsage;
+          return {
+            id: context.providerTurnId,
+            providerThreadId: context.input.providerThread.id,
+            nodeId: context.input.rootNodeId,
+            runAttemptId: context.input.attemptId,
+            nativeTurnRef:
+              context.nativePromptId === undefined
+                ? { driver, nativeId: context.nativeTurnId, strength: "weak" }
+                : { driver, nativeId: context.nativePromptId, strength: "strong" },
+            ordinal: context.input.providerTurnOrdinal,
+            status,
+            startedAt: context.startedAt,
+            completedAt,
+            ...(turnTokenUsage === undefined ? {} : { turnTokenUsage }),
+          };
+        };
 
         const terminalizeOpenRunOwnedItems = Effect.fnUntraced(function* (
           context: ActiveAcpTurn,
@@ -8639,6 +8672,25 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 updatedAt: now,
               },
             });
+          }
+          if (
+            context.resolvedTurnTokenUsage === undefined &&
+            context.checkTurnTokenUsage !== undefined
+          ) {
+            const promptUsage = acpPerTurnPromptUsage(
+              context.promptUsage,
+              context.subagents.size > 0,
+              settledStatus,
+              flavor.geminiPromptUsage,
+            );
+            if (promptUsage.usageStatus === "unavailable") {
+              context.resolvedTurnTokenUsage = yield* context
+                .checkTurnTokenUsage({
+                  hasSubagents: context.subagents.size > 0,
+                  terminalStatus: settledStatus,
+                })
+                .pipe(Effect.catchCause(() => Effect.undefined));
+            }
           }
           const turn = providerTurnPayload(context, settledStatus, now);
           yield* Ref.update(providerTurns, (current) => {
@@ -9468,6 +9520,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               promptSentAt: null,
               promptStarted,
               promptUsage: undefined,
+              checkTurnTokenUsage: undefined,
+              resolvedTurnTokenUsage: undefined,
               backgroundFinalizeGeneration: 0,
               replyOpen: false,
               nativePromptId: undefined,
@@ -9624,6 +9678,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               flavor.watchPromptOutcome === undefined
                 ? undefined
                 : yield* flavor.watchPromptOutcome(requestedSessionId);
+            if (flavor.watchTurnTokenUsage !== undefined) {
+              context.checkTurnTokenUsage = yield* flavor
+                .watchTurnTokenUsage({
+                  sessionId: requestedSessionId,
+                  cwd: turnInput.runtimePolicy.cwd ?? process.cwd(),
+                })
+                .pipe(Effect.catchCause(() => Effect.undefined));
+            }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
             const promptOptions = {
               dispatched: context.promptDispatched,
@@ -9711,6 +9773,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 flavor.watchPromptOutcome === undefined
                   ? undefined
                   : yield* flavor.watchPromptOutcome(context.nativeThreadId);
+              // Keep the snapshot captured at turn start: a mid-turn steer must not
+              // replace the baseline the turn's usage is diffed against.
+              if (
+                flavor.watchTurnTokenUsage !== undefined &&
+                context.checkTurnTokenUsage === undefined
+              ) {
+                context.checkTurnTokenUsage = yield* flavor
+                  .watchTurnTokenUsage({
+                    sessionId: context.nativeThreadId,
+                    cwd: context.input.runtimePolicy.cwd ?? process.cwd(),
+                  })
+                  .pipe(Effect.catchCause(() => Effect.undefined));
+              }
               const dispatched = yield* Deferred.make<void, never>();
               const steered = yield* runRuntimeCallbackAtGeneration(
                 generation,
