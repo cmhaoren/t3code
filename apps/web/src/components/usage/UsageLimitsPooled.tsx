@@ -14,7 +14,7 @@ import {
 import { T, useGT, useMessages } from "gt-react";
 import type { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { normalizeProviderAccentColor } from "@t3tools/client-runtime/state/provider-instance-display";
-import { AlertTriangleIcon, ExternalLinkIcon, TicketIcon } from "lucide-react";
+import { AlertTriangleIcon, ExternalLinkIcon, InfoIcon, TicketIcon } from "lucide-react";
 import {
   createContext,
   Fragment,
@@ -37,6 +37,7 @@ import { Button } from "../ui/button";
 import { OpenAI } from "../Icons";
 import { Alert, AlertTitle } from "../ui/alert";
 import { Popover, PopoverCreateHandle, PopoverPopup, PopoverTrigger } from "../ui/popover";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { PaceIcon, ResetCreditDialog, barColor, usePaceMark, useResetCredit } from "./UsageLimits";
 import {
   collectExternalUsageLinks,
@@ -413,7 +414,7 @@ function SegmentTriggers({
             type="button"
             style={{ gridColumn: index, gridRow: 1, ...paceMark?.gappedTrack }}
             aria-label={segmentLabel}
-            className="relative h-5 min-w-0 cursor-pointer rounded-md bg-muted text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[popup-open]:ring-1 data-[popup-open]:ring-inset data-[popup-open]:ring-border @2xl/pool:h-8"
+            className="relative h-5 min-w-0 cursor-pointer rounded-md bg-muted text-start outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[popup-open]:ring-1 data-[popup-open]:ring-inset data-[popup-open]:ring-border @lg/pool:h-6"
           />
         }
       >
@@ -448,11 +449,11 @@ function SegmentTriggers({
         ) : null}
         <span
           aria-hidden
-          className="absolute inset-0 flex items-center justify-center overflow-hidden rounded-md text-3xs leading-none font-semibold text-foreground/80 tabular-nums @2xl/pool:hidden"
+          className="absolute inset-0 flex items-center justify-center overflow-hidden rounded-md text-3xs leading-none font-semibold text-foreground/80 tabular-nums @lg/pool:hidden"
         >
           {index}
         </span>
-        <div className="relative hidden h-full min-w-0 items-center gap-1.5 overflow-hidden rounded-md px-2 text-xs @2xl/pool:flex">
+        <div className="relative hidden h-full min-w-0 items-center gap-1.5 overflow-hidden rounded-md px-1.5 text-2xs @lg/pool:flex">
           {showAccountName ? (
             <AccountName
               account={account}
@@ -466,7 +467,7 @@ function SegmentTriggers({
             </span>
           ) : null}
           {resetsIn || credits ? (
-            <span className="ms-auto flex min-w-0 items-center gap-1.5 overflow-hidden rounded-sm bg-background/85 px-1.5 py-0.5 text-2xs whitespace-nowrap text-foreground tabular-nums">
+            <span className="ms-auto flex min-w-0 items-center gap-1.5 overflow-hidden rounded-sm bg-background/85 px-1 py-0 text-2xs whitespace-nowrap text-foreground tabular-nums">
               {refillIn ?? ""}
               {credits ? (
                 <>
@@ -514,7 +515,7 @@ function LegendRow({
       payload={payload}
       style={{ gridColumn: "1 / -1", gridRow: index + 1 }}
       render={<Button variant="ghost" size="compact" />}
-      className="min-w-0 @2xl/pool:hidden"
+      className="min-w-0 @lg/pool:hidden"
     >
       <span className="relative inline-flex size-4 shrink-0 items-center justify-center rounded-sm text-3xs leading-none font-semibold text-foreground/80 tabular-nums">
         <span
@@ -586,11 +587,11 @@ function PoolBar({
             <div
               key={member.account.key}
               style={{ gridColumn: position + 1, gridRow: 1 }}
-              className="flex h-5 min-w-0 items-center justify-center gap-1.5 overflow-hidden rounded-md border border-dashed border-border text-3xs whitespace-nowrap text-muted-foreground @2xl/pool:h-8 @2xl/pool:justify-start @2xl/pool:px-2 @2xl/pool:text-xs"
+              className="flex h-5 min-w-0 items-center justify-center gap-1.5 overflow-hidden rounded-md border border-dashed border-border text-3xs whitespace-nowrap text-muted-foreground @lg/pool:h-6 @lg/pool:justify-start @lg/pool:px-2 @lg/pool:text-xs"
             >
               <AccountName
                 account={member.account}
-                className="hidden min-w-0 truncate @2xl/pool:inline-flex"
+                className="hidden min-w-0 truncate @lg/pool:inline-flex"
               />
               {gt("$0 cap")}
             </div>
@@ -601,7 +602,7 @@ function PoolBar({
   );
 }
 
-function PoolWindowCard({
+function PoolWindowRow({
   pool,
   color,
   now,
@@ -615,33 +616,63 @@ function PoolWindowCard({
   readonly description?: string | undefined;
 }) {
   const nextRefill = pool.resets.find((reset) => reset.restoresPercent > 0);
-  return (
-    <div className="grid items-center gap-x-6 gap-y-3 rounded-lg border border-border/60 p-4 md:grid-cols-[11rem_minmax(0,1fr)]">
-      <div className="flex flex-col gap-1">
-        {label !== null ? (
-          <span className="text-sm font-medium text-foreground">{label ?? pool.label}</span>
-        ) : null}
-        <span className="flex items-baseline gap-2">
-          <span className="text-3xl font-semibold text-foreground tabular-nums">
-            {pool.remainingPercent}%
-          </span>
-          <span className="inline-flex items-center gap-2 text-sm text-muted-foreground">
-            <span>
-              <T context="remaining usage percentage">left</T>
-            </span>
-            {pool.pace ? <PaceIcon pace={pool.pace} /> : null}
-          </span>
+  const windowLabel = label ?? pool.label;
+  const summary = (
+    <div className="flex shrink-0 items-center gap-1.5 whitespace-nowrap md:justify-end">
+      <span className="text-sm font-semibold text-foreground tabular-nums">
+        {pool.remainingPercent}%
+      </span>
+      <span className="text-2xs text-muted-foreground">
+        <T context="remaining usage percentage">left</T>
+      </span>
+      {pool.pace ? <PaceIcon pace={pool.pace} /> : null}
+      {nextRefill && pool.columns.length > 1 ? (
+        <span className="text-2xs font-medium text-muted-foreground tabular-nums">
+          ↻+{nextRefill.restoresPercent}%
         </span>
-        {nextRefill && pool.columns.length > 1 ? (
-          <span className="text-xs font-medium text-foreground tabular-nums">
-            ↻ +{nextRefill.restoresPercent}%
-          </span>
-        ) : null}
+      ) : null}
+    </div>
+  );
+  if (label === null) {
+    return (
+      <div
+        data-slot="usage-limit-window"
+        className="grid items-center gap-x-3 gap-y-1.5 px-3 py-1.5 md:grid-cols-[9rem_minmax(0,1fr)]"
+      >
+        {summary}
+        <PoolBar pool={pool} color={color} now={now} />
+      </div>
+    );
+  }
+  return (
+    <div
+      data-slot="usage-limit-window"
+      className="grid items-center gap-x-3 gap-y-1.5 px-3 py-1.5 md:grid-cols-[13rem_9rem_minmax(0,1fr)]"
+    >
+      <div className="flex items-center justify-between gap-2 md:contents">
+        <div className="flex min-w-0 items-center gap-1">
+          <span className="truncate text-xs font-medium text-foreground">{windowLabel}</span>
+          {description ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span
+                    role="img"
+                    aria-label={description}
+                    tabIndex={0}
+                    className="inline-flex shrink-0 text-muted-foreground/70 outline-none focus-visible:text-foreground"
+                  />
+                }
+              >
+                <InfoIcon className="size-3" aria-hidden />
+              </TooltipTrigger>
+              <TooltipPopup side="top">{description}</TooltipPopup>
+            </Tooltip>
+          ) : null}
+        </div>
+        {summary}
       </div>
       <PoolBar pool={pool} color={color} now={now} />
-      {description ? (
-        <p className="text-xs text-muted-foreground md:col-span-2">{description}</p>
-      ) : null}
     </div>
   );
 }
@@ -653,32 +684,39 @@ function PoolSection({ pool, now }: { readonly pool: LimitPool; readonly now: nu
   const windows = displayLimitWindows(pool);
   const m = useMessages();
   return (
-    <section className="flex flex-col gap-3">
-      <h2 className="flex items-center gap-2 text-sm font-medium text-foreground">
-        <ProviderInstanceIcon
-          driverKind={pool.driver}
-          displayName={label}
-          acpRegistryIconUrl={pool.iconUrl}
-          indicatorBackground="var(--background)"
-          className="size-5"
-          iconClassName="size-4 text-foreground/80"
-        />
-        {label}
-      </h2>
-      {windows.map((window) => {
-        const details =
-          pool.driver === "cursor" ? cursorUsageWindowDetails(window.id, pool, m) : undefined;
-        return (
-          <PoolWindowCard
-            key={`${window.kind}:${window.id}`}
-            pool={window}
-            color={color}
-            now={now}
-            label={details?.label}
-            description={details?.description}
+    <section
+      data-slot="usage-limit-pool"
+      className="overflow-hidden rounded-lg border border-border/60 bg-card/30"
+    >
+      <header className="flex items-center gap-1.5 border-b border-border/50 bg-muted/30 px-3 py-1.5">
+        <h2 className="flex min-w-0 items-center gap-1.5 text-xs font-semibold text-foreground">
+          <ProviderInstanceIcon
+            driverKind={pool.driver}
+            displayName={label}
+            acpRegistryIconUrl={pool.iconUrl}
+            indicatorBackground="var(--background)"
+            className="size-4 shrink-0"
+            iconClassName="size-3.5 text-foreground/80"
           />
-        );
-      })}
+          <span className="truncate">{label}</span>
+        </h2>
+      </header>
+      <div className="divide-y divide-border/40">
+        {windows.map((window) => {
+          const details =
+            pool.driver === "cursor" ? cursorUsageWindowDetails(window.id, pool, m) : undefined;
+          return (
+            <PoolWindowRow
+              key={`${window.kind}:${window.id}`}
+              pool={window}
+              color={color}
+              now={now}
+              label={details?.label}
+              description={details?.description}
+            />
+          );
+        })}
+      </div>
     </section>
   );
 }
@@ -698,7 +736,7 @@ export function UsageLimitsPooled({
   const notices = collectLimitNotices(presentations, m);
   const externalLinks = collectExternalUsageLinks(presentations, m);
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-3">
       {pools.length === 0 && notices.length === 0 && externalLinks.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           <T>No provider on the selected environments reports subscription limits.</T>
@@ -727,7 +765,7 @@ export function UsageLimitsPooled({
       {externalLinks.map((link) => (
         <section
           key={link.url}
-          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3.5 py-2.5"
         >
           <div className="flex min-w-0 flex-1 items-center gap-3">
             {link.url === CHATGPT_USAGE_URL ? (

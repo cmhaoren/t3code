@@ -3,11 +3,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Layer from "effect/Layer";
 import { describe, expect, it } from "@effect/vitest";
+import { ProviderInstanceId, ProviderSetupError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
@@ -72,8 +74,16 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     missingToken?: boolean;
     authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
     keyringSecret?: string;
+    /** Reads the OS keyring from this effect instead of `keyringSecret`. */
+    readKeyringSecret?: Effect.Effect<string | undefined>;
     /** Reads the OS keyring instead of `keyringSecret`. */
     nativeKeyring?: boolean;
+    /** The access token the probe must present; the renewal test swaps it. */
+    accessToken?: string;
+    /** A sign-in renewal the probe may run; it receives the CLI token file writer. */
+    renewCliToken?: (
+      writeCliToken: (contents: string) => Effect.Effect<void>,
+    ) => Effect.Effect<void, ProviderSetupError>;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -92,6 +102,10 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
       }),
     );
   if (!options.missingToken) yield* writeToken(options.refreshToken ?? "refresh-a");
+  const cliTokenPath = path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token");
+  const writeCliToken = (contents: string) =>
+    fs.writeFileString(cliTokenPath, contents).pipe(Effect.orDie);
+  const accessToken = options.accessToken ?? "access-token";
   const requests: Array<{ url: string; body: string }> = [];
   const http = HttpClient.make((request, url, _signal, fiber) =>
     Effect.sync(() => {
@@ -105,12 +119,12 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
         return HttpClientResponse.fromWeb(
           request,
           Response.json(
-            { access_token: "access-token", expires_in: 3600 },
+            { access_token: accessToken, expires_in: 3600 },
             { status: options.tokenStatus ?? 200 },
           ),
         );
       }
-      expect(request.headers.authorization).toBe("Bearer access-token");
+      expect(request.headers.authorization).toBe(`Bearer ${accessToken}`);
       if (request.url.endsWith("/userinfo")) {
         return HttpClientResponse.fromWeb(
           request,
@@ -137,13 +151,36 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
       ),
     ),
   );
+  const renewCliToken = options.renewCliToken?.(writeCliToken);
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
-    ...(options.nativeKeyring ? {} : { readKeyringSecret: Effect.succeed(options.keyringSecret) }),
+    ...(options.nativeKeyring
+      ? {}
+      : { readKeyringSecret: options.readKeyringSecret ?? Effect.succeed(options.keyringSecret) }),
+    ...(renewCliToken ? { renewCliToken } : {}),
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
-  return { ...usage, requests, writeToken, tokenPath };
+  return { ...usage, requests, writeToken, tokenPath, writeCliToken };
 });
+
+const cliTokenFile = (accessToken: string, expiry: string, refreshToken?: string) =>
+  JSON.stringify({
+    token: {
+      access_token: accessToken,
+      token_type: "Bearer",
+      ...(refreshToken === undefined ? {} : { refresh_token: refreshToken }),
+      expiry,
+    },
+    auth_method: "consumer",
+    id_token_email: "someone@example.com",
+  });
+
+const renewalFailure = (detail: string) =>
+  new ProviderSetupError({
+    instanceId: ProviderInstanceId.make("antigravity-renewal-test"),
+    operation: "authenticate",
+    detail,
+  });
 
 describe("Antigravity subscription limits", () => {
   // Oracle: the 10:16 UTC payload and its narrow Workaround rule.
@@ -688,6 +725,175 @@ describe("Antigravity subscription limits", () => {
         "Sign in with Google to see Antigravity limits.",
       );
       expect(limits.unavailable?.reason).not.toBe("unsupported");
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("renews an expired CLI sign-in once and reads limits with its new token", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const renewals = yield* Ref.make(0);
+      const { probe, writeCliToken } = yield* fixture({
+        missingToken: true,
+        accessToken: "access-token-renewed",
+        renewCliToken: (write) =>
+          Ref.update(renewals, (count) => count + 1).pipe(
+            Effect.andThen(
+              write(cliTokenFile("access-token-renewed", "2026-10-09T14:00:00Z", "refresh-a")),
+            ),
+          ),
+      });
+      yield* writeCliToken(
+        cliTokenFile("access-token-expired", "2026-10-09T11:00:00Z", "refresh-a"),
+      );
+      const limits = yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(1);
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.windows).toHaveLength(4);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("does not renew a CLI sign-in that is still fresh", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const renewals = yield* Ref.make(0);
+      const { probe, writeCliToken } = yield* fixture({
+        missingToken: true,
+        renewCliToken: () => Ref.update(renewals, (count) => count + 1),
+      });
+      yield* writeCliToken(cliTokenFile("access-token", "2026-10-09T14:00:00Z"));
+      const limits = yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(0);
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.windows).toHaveLength(4);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("keeps the expired sign-in when the CLI token has nothing to refresh", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const renewals = yield* Ref.make(0);
+      const { probe, requests, writeCliToken } = yield* fixture({
+        missingToken: true,
+        renewCliToken: () => Ref.update(renewals, (count) => count + 1),
+      });
+      yield* writeCliToken(cliTokenFile("access-token", "2026-10-09T11:00:00Z"));
+      const limits = yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(0);
+      expect(requests).toEqual([]);
+      expect(limits.unavailable?.reason).toBe("probeFailed");
+      expect(limits.unavailable?.message).toBe(
+        "Antigravity's saved sign-in has expired. Start an Antigravity turn to renew it, then refresh limits.",
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("does not renew when no CLI sign-in is stored", () =>
+    Effect.gen(function* () {
+      const renewals = yield* Ref.make(0);
+      const { probe, requests } = yield* fixture({
+        missingToken: true,
+        renewCliToken: () => Ref.update(renewals, (count) => count + 1),
+      });
+      expect((yield* probe).unavailable?.reason).toBe("unsupported");
+      expect(yield* Ref.get(renewals)).toBe(0);
+      expect(requests).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("backs off a failed renewal for five minutes, then allows one more attempt", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const renewals = yield* Ref.make(0);
+      const { probe, clear, writeCliToken } = yield* fixture({
+        missingToken: true,
+        renewCliToken: () =>
+          Ref.update(renewals, (count) => count + 1).pipe(
+            Effect.andThen(Effect.fail(renewalFailure("no usable sign-in"))),
+          ),
+      });
+      yield* writeCliToken(cliTokenFile("access-token", "2026-10-09T11:00:00Z", "refresh-a"));
+      const expired =
+        "Antigravity's saved sign-in has expired. Start an Antigravity turn to renew it, then refresh limits.";
+      expect((yield* probe).unavailable?.message).toBe(expired);
+      expect(yield* Ref.get(renewals)).toBe(1);
+
+      expect((yield* probe).unavailable?.message).toBe(expired);
+      expect(yield* Ref.get(renewals)).toBe(1);
+
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:04:59Z")));
+      yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(1);
+
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:05:00Z")));
+      yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(2);
+
+      // A rewritten token is a new attempt, even inside the cooldown.
+      yield* writeCliToken(cliTokenFile("access-token", "2026-10-09T11:30:00Z", "refresh-a"));
+      yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(3);
+
+      // Sign-out clears the cooldown with everything else.
+      yield* clear;
+      yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(4);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("renews an expired Gemini Enterprise keyring sign-in", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const renewals = yield* Ref.make(0);
+      const secret = yield* Ref.make(
+        JSON.stringify({
+          token: {
+            access_token: "access-token",
+            refresh_token: "refresh-a",
+            expiry: "2026-10-09T11:00:00Z",
+          },
+        }),
+      );
+      const { probe } = yield* fixture({
+        authMethod: "oauth-business",
+        missingToken: true,
+        readKeyringSecret: Ref.get(secret),
+        renewCliToken: () =>
+          Ref.update(renewals, (count) => count + 1).pipe(
+            Effect.andThen(
+              Ref.set(
+                secret,
+                JSON.stringify({
+                  token: {
+                    access_token: "access-token",
+                    refresh_token: "refresh-a",
+                    expiry: "2026-10-09T14:00:00Z",
+                  },
+                }),
+              ),
+            ),
+          ),
+      });
+      const limits = yield* probe;
+      expect(yield* Ref.get(renewals)).toBe(1);
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.windows).toHaveLength(4);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("keeps renewal failures out of the reported limits", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const { probe, writeCliToken } = yield* fixture({
+        missingToken: true,
+        renewCliToken: () =>
+          Effect.fail(renewalFailure("refresh-a client-secret access-token-expired")),
+      });
+      yield* writeCliToken(
+        cliTokenFile("access-token-expired", "2026-10-09T11:00:00Z", "refresh-a"),
+      );
+      const limits = yield* probe;
+      expect(limits.unavailable?.reason).toBe("probeFailed");
+      expect(JSON.stringify(limits)).not.toMatch(/refresh-a|client-secret|access-token-expired/);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 

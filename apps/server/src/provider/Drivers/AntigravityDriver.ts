@@ -311,10 +311,41 @@ export const AntigravityDriver: ProviderDriver<
       };
     });
 
+    // A custom or PATH executable has no version until it answers initialize, and every runtime
+    // (sessions, model refresh, token renewal) must refuse one the policy rates as broken.
+    const refuseIncompatibleRuntime = Effect.fn("AntigravityDriver.refuseIncompatibleRuntime")(
+      function* (
+        executable: Pick<
+          AntigravityInstallation.AntigravityExecutable,
+          "source" | "executablePath"
+        >,
+        version: string | undefined,
+      ) {
+        if (!version) return;
+        const advisory = yield* installation.compatibility(version);
+        const refused = brokenRuntimeError({
+          instanceId,
+          name: "Antigravity",
+          version,
+          advisory,
+          action:
+            executable.source === "managed"
+              ? "Update it in Antigravity setup"
+              : `Update the Antigravity executable at ${executable.executablePath}`,
+        });
+        if (refused) {
+          return yield* new AcpErrors.AcpTransportError({ detail: refused.detail, cause: refused });
+        }
+      },
+    );
+
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
       input: AntigravityAdapterV2RuntimeInput,
     ): Effect.fn.Return<
-      AcpSessionRuntime.AcpSessionRuntime["Service"],
+      AcpSessionRuntime.AcpSessionRuntime["Service"] & {
+        /** The executable behind this runtime, for compatibility checks after initialize. */
+        readonly executable: AntigravityInstallation.AntigravityExecutable;
+      },
       AcpErrors.AcpError | ProviderSetupError,
       Scope.Scope
     > {
@@ -336,27 +367,15 @@ export const AntigravityDriver: ProviderDriver<
       }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
       // A custom or PATH executable has no version until it answers initialize.
       const startCompatible = Effect.fn("AntigravityDriver.startCompatible")(function* () {
-        const version = (yield* runtime.initialize()).agentInfo?.version;
-        const advisory = version ? yield* installation.compatibility(version) : undefined;
-        const refused =
-          version &&
-          brokenRuntimeError({
-            instanceId,
-            name: "Antigravity",
-            version,
-            advisory,
-            action:
-              executable.source === "managed"
-                ? "Update it in Antigravity setup"
-                : `Update the Antigravity executable at ${executable.executablePath}`,
-          });
-        if (refused) {
-          return yield* new AcpErrors.AcpTransportError({ detail: refused.detail, cause: refused });
-        }
+        yield* refuseIncompatibleRuntime(
+          executable,
+          (yield* runtime.initialize()).agentInfo?.version,
+        );
         return yield* runtime.start();
       });
       return {
         ...runtime,
+        executable,
         setMode: (modeId: string) =>
           runtime.getModeState.pipe(
             Effect.flatMap((modeState) =>
@@ -537,6 +556,60 @@ export const AntigravityDriver: ProviderDriver<
       codeLogin,
     });
 
+    // `agy` renews its saved sign-in on ACP `authenticate`, without `session/new`. A user-visible
+    // flow would ask for a browser, and its sign-in signal would clear this probe's own usage fiber;
+    // withProcess keeps renewal exclusive with those flows and lets interruption close the process.
+    const renewCliToken = Effect.fn("AntigravityDriver.renewCliToken")(
+      function* () {
+        const processScope = yield* Scope.make();
+        yield* Effect.addFinalizer((exit) => Scope.close(processScope, exit));
+        yield* authFlow
+          .withProcess(
+            Scope.close(processScope, Exit.void),
+            Effect.gen(function* () {
+              const cwd = yield* fileSystem
+                .makeTempDirectoryScoped({ prefix: "t3-antigravity-renew-" })
+                .pipe(
+                  Effect.mapError(
+                    () =>
+                      new ProviderSetupError({
+                        instanceId,
+                        operation: "start",
+                        detail: "Could not create an Antigravity renewal workspace.",
+                      }),
+                  ),
+                );
+              // No `onAuthorizationUrl`: a runtime that needs a browser must fail instead.
+              const runtime = yield* makeRuntime({ cwd, mcpServers: [] });
+              yield* refuseIncompatibleRuntime(
+                runtime.executable,
+                (yield* runtime.initialize()).agentInfo?.version,
+              );
+              if (!runtime.authenticate) {
+                return yield* new ProviderSetupError({
+                  instanceId,
+                  operation: "authenticate",
+                  detail: "Antigravity runtime does not support authentication.",
+                });
+              }
+              yield* runtime.authenticate(auth.authMethod);
+            }),
+          )
+          .pipe(Effect.provideService(Scope.Scope, processScope));
+      },
+      Effect.scoped,
+      // The probe reports its fixed expired message; keep causes (agent output) out of it.
+      Effect.mapError(
+        (cause) =>
+          new ProviderSetupError({
+            instanceId,
+            operation: "authenticate",
+            detail: "Antigravity could not renew its saved sign-in.",
+            cause,
+          }),
+      ),
+    );
+
     // The probe must not spawn. The agent is a PyInstaller one-file bundle
     // that unpacks about 1 GB per launch, and the health check runs every
     // minute.
@@ -579,6 +652,9 @@ export const AntigravityDriver: ProviderDriver<
     const usage = yield* makeAntigravityUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
+      ...(auth.authMethod === "oauth-personal" || auth.authMethod === "oauth-business"
+        ? { renewCliToken: renewCliToken() }
+        : {}),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
