@@ -409,6 +409,16 @@ import {
   ProviderConsumeResetCreditInput,
   ProviderConsumeResetCreditResult,
 } from "./providerUsageLimits.ts";
+import {
+  CheckProviderRuntimeUpdatesInput,
+  ListProviderRuntimesInput,
+  PruneProviderRuntimeVersionsInput,
+  PruneProviderRuntimeVersionsResult,
+  ProviderRuntimeInventory,
+  ProviderRuntimeMaintenanceError,
+  UpdateProviderRuntimeInput,
+  UpdateProviderRuntimeResult,
+} from "./providerRuntimeMaintenance.ts";
 import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
 import {
   StorageCleanupReport,
@@ -603,6 +613,10 @@ export const WS_METHODS = {
   serverSetAcpRegistryProvider: "server.setAcpRegistryProvider",
   serverDisableAcpRegistryProvider: "server.disableAcpRegistryProvider",
   serverLogoutAcpRegistry: "server.logoutAcpRegistry",
+  serverListProviderRuntimes: "server.listProviderRuntimes",
+  serverCheckProviderRuntimeUpdates: "server.checkProviderRuntimeUpdates",
+  serverUpdateProviderRuntime: "server.updateProviderRuntime",
+  serverPruneProviderRuntimeVersions: "server.pruneProviderRuntimeVersions",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetHostResources: "server.getHostResources",
@@ -1084,6 +1098,41 @@ const WsServerLogoutAcpRegistryRpc = Rpc.make(WS_METHODS.serverLogoutAcpRegistry
   success: AcpRegistryLogoutResult,
   error: Schema.Union([AcpRegistryOperationError, EnvironmentAuthorizationError]),
 });
+
+const ProviderRuntimeMaintenanceRpcError = Schema.Union([
+  ProviderRuntimeMaintenanceError,
+  EnvironmentAuthorizationError,
+]);
+
+const WsServerListProviderRuntimesRpc = Rpc.make(WS_METHODS.serverListProviderRuntimes, {
+  payload: ListProviderRuntimesInput,
+  success: ProviderRuntimeInventory,
+  error: ProviderRuntimeMaintenanceRpcError,
+});
+
+const WsServerCheckProviderRuntimeUpdatesRpc = Rpc.make(
+  WS_METHODS.serverCheckProviderRuntimeUpdates,
+  {
+    payload: CheckProviderRuntimeUpdatesInput,
+    success: ProviderRuntimeInventory,
+    error: ProviderRuntimeMaintenanceRpcError,
+  },
+);
+
+const WsServerUpdateProviderRuntimeRpc = Rpc.make(WS_METHODS.serverUpdateProviderRuntime, {
+  payload: UpdateProviderRuntimeInput,
+  success: UpdateProviderRuntimeResult,
+  error: ProviderRuntimeMaintenanceRpcError,
+});
+
+const WsServerPruneProviderRuntimeVersionsRpc = Rpc.make(
+  WS_METHODS.serverPruneProviderRuntimeVersions,
+  {
+    payload: PruneProviderRuntimeVersionsInput,
+    success: PruneProviderRuntimeVersionsResult,
+    error: ProviderRuntimeMaintenanceRpcError,
+  },
+);
 
 const WsServerGetTraceDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetTraceDiagnostics, {
   payload: Schema.Struct({}),
@@ -2450,6 +2499,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerSetAcpRegistryProviderRpc,
   WsServerDisableAcpRegistryProviderRpc,
   WsServerLogoutAcpRegistryRpc,
+  WsServerListProviderRuntimesRpc,
+  WsServerCheckProviderRuntimeUpdatesRpc,
+  WsServerUpdateProviderRuntimeRpc,
+  WsServerPruneProviderRuntimeVersionsRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetHostResourcesRpc,

@@ -40,7 +40,7 @@ import {
 import * as Arr from "effect/Array";
 import * as Duration from "effect/Duration";
 import * as Result from "effect/Result";
-import { PlusIcon } from "lucide-react";
+import { PlusIcon, ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { useRef, useState, type ReactNode } from "react";
 import { msg, T, useGT, useMessages, Var } from "gt-react";
 import { m as resolveNow, type MessageResolver } from "../../i18n/messages";
@@ -101,9 +101,12 @@ import { useManagedPolicy } from "~/state/managedPolicy";
 import { ExpandableText } from "./ExpandableText";
 import { IntervalSecondsField } from "./IntervalSecondsField";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
+import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
+import { getProviderVersionLabel } from "./providerStatus";
 import { useSecretSources } from "./SecretSourceInput";
 import { TextGeneratorsSettings } from "./TextGeneratorsSettings";
 import { UsageProviderSettings } from "./UsageProviderSettings";
+import { ProviderRuntimeMaintenanceSection } from "./ProviderRuntimeMaintenanceSection";
 import { ProviderSetupSection, readAntigravityAuthMethod } from "./ProviderSetupSection";
 import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
 import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
@@ -128,9 +131,13 @@ import {
 import {
   buildProviderEnvironmentOptions,
   buildProviderInstanceOverridePatch,
+  buildProviderInstanceTree,
   classifyProviderEnvironmentAccess,
+  isProviderGroupExpanded,
   isProviderSettingsEnvironmentAvailable,
+  resolveProviderGroupIdentity,
   type ProviderEnvironmentAccess,
+  type ProviderInstanceTreeGroup,
   type ProviderOperateAccess,
   resolveRemoteOperateAccess,
   resolveSelectedProviderEnvironmentId,
@@ -583,6 +590,7 @@ export function EnvironmentProviderSettings({
   const canAddProvider =
     !readOnly && managedPolicy?.limits?.providers?.allowedDrivers?.length !== 0;
   const canWriteSettings = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
+  const canManageProviders = useEnvironmentScope(environmentId, AuthProvidersManageScope);
   const canRefreshProviders = useEnvironmentScope(environmentId, AuthOrchestrationReadScope);
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
   const updateModelPreferences = useUpdateEnvironmentModelPreferences(environmentId);
@@ -612,6 +620,9 @@ export function EnvironmentProviderSettings({
   const [selectedInstanceId, setSelectedInstanceId] = useState<ProviderInstanceId | null>(
     targetInstanceId ?? null,
   );
+  const [groupExpandedOverrides, setGroupExpandedOverrides] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
   const [updatingProviderInstanceIds, setUpdatingProviderInstanceIds] = useState<
     ReadonlySet<ProviderInstanceId>
   >(() => new Set());
@@ -809,13 +820,78 @@ export function EnvironmentProviderSettings({
     }
   }
 
+  const liveProvidersById = new Map(
+    serverProviders.map((provider) => [provider.instanceId, provider]),
+  );
+  const representativeProjectId = projectIds[0];
+  const showProjectOverride =
+    representativeProjectId !== undefined && supportsProjectProviderOverrides;
+  const resolveRowEnabled = (row: InstanceRow): boolean =>
+    showProjectOverride
+      ? resolveProjectProviderInstanceEnabled(settings, representativeProjectId, row.instanceId)
+      : resolveProviderInstanceEnabled(row.explicitInstance ?? { driver: row.driver });
+
+  const providerTreeGroups = buildProviderInstanceTree(
+    rows.map((row, originalIndex) => {
+      const liveProvider = liveProvidersById.get(row.instanceId);
+      const driverLabel =
+        providerClients.get(row.driver)?.label ??
+        PROVIDER_DISPLAY_NAMES[row.driver] ??
+        String(row.driver);
+      const identity = resolveProviderGroupIdentity({
+        driver: row.driver,
+        config: row.explicitInstance?.config,
+        driverLabel,
+        liveIconUrl: liveProvider?.iconUrl ?? null,
+      });
+      return {
+        row,
+        instanceId: row.instanceId,
+        driver: row.driver,
+        isDefault: row.isDefault,
+        enabled: resolveRowEnabled(row),
+        groupKey: identity.groupKey,
+        groupLabel: identity.groupLabel,
+        acpRegistryAgentId: identity.acpRegistryAgentId,
+        acpRegistryIconUrl: identity.acpRegistryIconUrl,
+        versionLabel: getProviderVersionLabel(liveProvider?.version),
+        originalIndex,
+      };
+    }),
+  );
+  const sortedRows = providerTreeGroups.flatMap((group) => group.items.map((item) => item.row));
+  const groupByInstanceId = new Map<ProviderInstanceId, ProviderInstanceTreeGroup<InstanceRow>>();
+  for (const group of providerTreeGroups) {
+    for (const item of group.items) groupByInstanceId.set(item.instanceId, group);
+  }
+
+  // Turning off the last enabled instance would collapse its group under the click.
+  const preserveExpandedGroupOnDisable = (instanceId: ProviderInstanceId) => {
+    const group = groupByInstanceId.get(instanceId);
+    if (group === undefined || group.items.length < 2) return;
+    const expanded = isProviderGroupExpanded({
+      group,
+      selectedInstanceId,
+      targetInstanceId,
+      overrides: groupExpandedOverrides,
+    });
+    if (!expanded) return;
+    const hasOtherEnabled = group.items.some(
+      (item) => item.instanceId !== instanceId && item.enabled,
+    );
+    if (hasOtherEnabled) return;
+    setGroupExpandedOverrides((previous) =>
+      previous[group.groupKey] === true ? previous : { ...previous, [group.groupKey]: true },
+    );
+  };
+
   const targetInstanceMissing =
     targetInstanceId !== undefined &&
     selectedInstanceId === targetInstanceId &&
     !rows.some((row) => row.instanceId === targetInstanceId);
   const selectedRow =
-    rows.find((row) => row.instanceId === selectedInstanceId) ??
-    (targetInstanceMissing ? null : (rows[0] ?? null));
+    sortedRows.find((row) => row.instanceId === selectedInstanceId) ??
+    (targetInstanceMissing ? null : (sortedRows[0] ?? null));
 
   const persistInstance = async (
     instanceId: ProviderInstanceId,
@@ -855,6 +931,7 @@ export function EnvironmentProviderSettings({
       next: ProviderInstanceConfig,
     ) => {
       const isDisabling = next.enabled === false && resolveProviderInstanceEnabled(previous);
+      if (isDisabling) preserveExpandedGroupOnDisable(instanceId);
       const shouldClearTextGen =
         isDisabling &&
         resolveAppModelSelectionState(settings, serverProviders).instanceId === instanceId &&
@@ -950,6 +1027,12 @@ export function EnvironmentProviderSettings({
 
   const writeProjectOverride = useStableCallback(
     (instanceId: ProviderInstanceId, next: boolean | undefined) => {
+      const targetRow = rows.find((row) => row.instanceId === instanceId);
+      const resetsToDisabled =
+        next === undefined &&
+        targetRow !== undefined &&
+        !resolveProviderInstanceEnabled(targetRow.explicitInstance ?? { driver: targetRow.driver });
+      if (next === false || resetsToDisabled) preserveExpandedGroupOnDisable(instanceId);
       updateSettings({
         projectSettingsOverrides: buildProviderInstanceOverridePatch(
           settings,
@@ -978,10 +1061,15 @@ export function EnvironmentProviderSettings({
   // resolveModelPreferences falls back to a fresh `[]`; keep it stable for the rows.
   const favorites = settings.favorites.length > 0 ? settings.favorites : NO_FAVORITES;
 
-  const representativeProjectId = projectIds[0];
-  const renderProviderInstance = (row: InstanceRow, mode: "list" | "editor") => {
-    const showProjectOverride =
-      representativeProjectId !== undefined && supportsProjectProviderOverrides;
+  const renderProviderInstance = (
+    row: InstanceRow,
+    mode: "list" | "editor",
+    tree?: {
+      readonly treeChild: boolean;
+      readonly parentVersionLabel: string | null;
+      readonly groupKey: string;
+    },
+  ) => {
     return (
       <ProviderInstanceRow
         key={row.instanceId}
@@ -996,9 +1084,11 @@ export function EnvironmentProviderSettings({
         selected={mode === "list" && selectedRow?.instanceId === row.instanceId}
         readOnly={readOnly}
         canWriteSettings={canWriteSettings}
-        liveProvider={serverProviders.find((candidate) => candidate.instanceId === row.instanceId)}
+        liveProvider={liveProvidersById.get(row.instanceId)}
         isUpdateDispatching={updatingProviderInstanceIds.has(row.instanceId)}
         showProjectOverride={showProjectOverride}
+        treeChild={tree?.treeChild}
+        parentVersionLabel={tree?.parentVersionLabel}
         projectOverrideValue={
           showProjectOverride
             ? settings.projectSettingsOverrides[representativeProjectId]?.providerInstances?.[
@@ -1111,7 +1201,91 @@ export function EnvironmentProviderSettings({
               className="@min-[48rem]/providers:min-h-0 @min-[48rem]/providers:flex-1"
             >
               <div className="divide-y divide-border/50">
-                {rows.map((row) => renderProviderInstance(row, "list"))}
+                {providerTreeGroups.map((group) => {
+                  if (group.items.length === 1) {
+                    return renderProviderInstance(group.items[0]!.row, "list");
+                  }
+                  const expanded = isProviderGroupExpanded({
+                    group,
+                    selectedInstanceId,
+                    targetInstanceId,
+                    overrides: groupExpandedOverrides,
+                  });
+                  const groupLabel =
+                    group.groupKey === "acp:local" ? gt("Local ACP") : group.groupLabel;
+                  return (
+                    <div key={group.groupKey} data-provider-tree-group={group.groupKey}>
+                      <button
+                        type="button"
+                        aria-expanded={expanded}
+                        onClick={() =>
+                          setGroupExpandedOverrides((previous) => ({
+                            ...previous,
+                            [group.groupKey]: !expanded,
+                          }))
+                        }
+                        className="group flex w-full cursor-pointer items-center text-left outline-none transition-colors hover:bg-muted/25 focus-visible:bg-muted/25"
+                      >
+                        <span
+                          className={cn(
+                            "flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5",
+                            !group.hasEnabled && "opacity-60 group-hover:opacity-100",
+                          )}
+                        >
+                          {expanded ? (
+                            <ChevronDownIcon
+                              className="size-3.5 shrink-0 text-muted-foreground"
+                              aria-hidden
+                            />
+                          ) : (
+                            <ChevronRightIcon
+                              className="size-3.5 shrink-0 text-muted-foreground"
+                              aria-hidden
+                            />
+                          )}
+                          <ProviderInstanceIcon
+                            driverKind={group.driver}
+                            displayName={groupLabel}
+                            acpRegistryAgentId={group.acpRegistryAgentId}
+                            acpRegistryIconUrl={group.acpRegistryIconUrl}
+                            showBadge={false}
+                            className="size-5"
+                            iconClassName="size-4 text-foreground/80"
+                          />
+                          <span className="truncate text-sm font-medium text-foreground">
+                            {groupLabel}
+                          </span>
+                          {group.sharedVersionLabel ? (
+                            <code className="max-w-20 shrink-0 truncate text-xs text-muted-foreground">
+                              {group.sharedVersionLabel}
+                            </code>
+                          ) : null}
+                          <span
+                            className={cn(
+                              "ml-auto shrink-0 font-mono text-xs tabular-nums",
+                              group.hasEnabled ? "text-foreground/80" : "text-muted-foreground",
+                            )}
+                          >
+                            {group.enabledCount}/{group.totalCount}
+                          </span>
+                        </span>
+                      </button>
+                      {expanded ? (
+                        <div className="divide-y divide-border/40 border-t border-border/40 bg-background/40 pl-3">
+                          <div className="ml-3.5 border-l-2 border-border/50">
+                            {group.items.map((item) =>
+                              renderProviderInstance(item.row, "list", {
+                                treeChild: true,
+                                parentVersionLabel: group.sharedVersionLabel,
+                                groupKey: group.groupKey,
+                              }),
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
                 {canAddProvider ? (
                   <button
                     type="button"
@@ -1144,6 +1318,19 @@ export function EnvironmentProviderSettings({
           </div>
         </SettingsGroup>
       </SettingsSection>
+
+      <ProviderRuntimeMaintenanceSection
+        key={`provider-runtimes:${environmentId}`}
+        environmentId={environmentId}
+        readOnly={readOnly}
+        canWriteSettings={canWriteSettings}
+        canManageProviders={!readOnly && canManageProviders}
+        autoPruneOldVersions={settings.autoPruneProviderRuntimeVersions}
+        onToggleAutoPrune={(enabled) =>
+          updateSettings({ autoPruneProviderRuntimeVersions: enabled })
+        }
+        onRuntimeChanged={refreshProviders}
+      />
 
       <UsageProviderSettings
         key={environmentId}
@@ -1302,6 +1489,8 @@ function ProviderInstanceRow({
   liveProvider,
   isUpdateDispatching,
   showProjectOverride,
+  treeChild,
+  parentVersionLabel,
   projectOverrideValue,
   projectOverrideEffectiveEnabled,
   modelPreferences,
@@ -1322,6 +1511,8 @@ function ProviderInstanceRow({
   readonly liveProvider: ServerProvider | undefined;
   readonly isUpdateDispatching: boolean;
   readonly showProjectOverride: boolean;
+  readonly treeChild?: boolean | undefined;
+  readonly parentVersionLabel?: string | null | undefined;
   readonly projectOverrideValue: boolean | undefined;
   readonly projectOverrideEffectiveEnabled: boolean;
   readonly modelPreferences:
@@ -1383,6 +1574,8 @@ function ProviderInstanceRow({
       liveProvider={liveProvider}
       mode={mode}
       selected={selected}
+      treeChild={treeChild}
+      parentVersionLabel={parentVersionLabel}
       onSelect={mode === "list" ? () => actions.selectInstance(instanceId) : undefined}
       readOnly={readOnly}
       runtime={

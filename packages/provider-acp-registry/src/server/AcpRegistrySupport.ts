@@ -15,6 +15,7 @@ import type { AcpRegistryDistributionPreference } from "../settings.ts";
 import type { AcpRegistrySettings } from "../settings.ts";
 import { cliArchiveTarCommand } from "@t3tools/shared/cliRelease";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { compareSemverVersions } from "@t3tools/shared/semver";
 import {
   mergePathEntries,
   resolveSpawnCommand,
@@ -22,6 +23,7 @@ import {
 } from "@t3tools/shared/shell";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -203,6 +205,138 @@ const encodePackageInstallReceipt = Schema.encodeSync(
 );
 const decodeHttpsUrl = Schema.decodeUnknownEffect(HttpsUrl);
 const decodeBoundedAgentId = Schema.decodeUnknownEffect(BoundedAgentId);
+const decodeBoundedVersion = Schema.decodeUnknownEffect(BoundedVersion);
+
+// Active version pins and remote update check results live beside registry.json because two
+// AcpRegistryCatalog layers share the same cache and tools directories.
+const ACP_REGISTRY_STATE_VERSION = 1;
+const AcpRegistryDistributionState = Schema.Literals(["binary", "npx", "uvx"]);
+const ActiveVersionsFile = Schema.Struct({
+  version: Schema.Number,
+  agents: Schema.Record(Schema.String, Schema.Unknown),
+});
+const ActiveVersionEntry = Schema.Struct({
+  version: BoundedVersion,
+  distribution: AcpRegistryDistributionState,
+  updatedAt: Schema.String,
+});
+const RemoteUpdatesFile = Schema.Struct({
+  version: Schema.Number,
+  checkedAt: Schema.String,
+  agents: Schema.Record(Schema.String, Schema.Unknown),
+});
+const RemoteUpdateEntry = Schema.Struct({
+  latestVersion: BoundedVersion,
+  distribution: AcpRegistryDistributionState,
+});
+const decodeActiveVersionsFile = Schema.decodeUnknownEffect(ActiveVersionsFile);
+const decodeRemoteUpdatesFile = Schema.decodeUnknownEffect(RemoteUpdatesFile);
+const decodeActiveVersionEntry = Schema.decodeUnknownOption(ActiveVersionEntry);
+const decodeRemoteUpdateEntry = Schema.decodeUnknownOption(RemoteUpdateEntry);
+const encodeActiveVersionsFile = Schema.encodeSync(Schema.fromJsonString(ActiveVersionsFile));
+const encodeRemoteUpdatesFile = Schema.encodeSync(Schema.fromJsonString(RemoteUpdatesFile));
+
+export interface AcpRegistryManagedVersion {
+  readonly id: string;
+  readonly version: string;
+  readonly sizeBytes: number;
+  readonly isActive: boolean;
+  readonly installedAt: string | null;
+  readonly path: string;
+  readonly distribution: AcpRegistryDistributionKind | null;
+}
+
+export interface AcpRegistryManagedVersions {
+  readonly agentId: string;
+  readonly activeVersion: string | null;
+  readonly latestVersion: string | null;
+  readonly lastCheckedAt: string | null;
+  readonly distribution: AcpRegistryDistributionKind | null;
+  readonly versions: ReadonlyArray<AcpRegistryManagedVersion>;
+}
+
+export interface AcpRegistryRemoteUpdate {
+  readonly agentId: string;
+  readonly latestVersion: string;
+  readonly distribution: AcpRegistryDistributionKind;
+}
+
+export interface AcpRegistryRemoteUpdates {
+  readonly checkedAt: string;
+  readonly agents: ReadonlyArray<AcpRegistryRemoteUpdate>;
+}
+
+export interface AcpRegistryVersionUpdateResult {
+  readonly previousVersion: string | null;
+  readonly activeVersion: string;
+  readonly prunedVersions: ReadonlyArray<string>;
+  readonly reclaimedBytes: number;
+}
+
+export interface AcpRegistryVersionSwitchResult {
+  readonly previousVersion: string | null;
+  readonly activeVersion: string;
+}
+
+export type AcpRegistryPruneSkipReason = "active" | "in_use" | "not_found" | "failed";
+
+export interface AcpRegistryPruneResult {
+  readonly deleted: ReadonlyArray<{ readonly version: string; readonly sizeBytes: number }>;
+  readonly reclaimedBytes: number;
+  readonly skipped: ReadonlyArray<{
+    readonly version: string;
+    readonly reason: AcpRegistryPruneSkipReason;
+  }>;
+}
+
+function parseVersionDirectoryName(directoryName: string): string | undefined {
+  try {
+    return decodeURIComponent(directoryName);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Rewrites an agent so it targets `pinnedVersion`. Package distributions carry their version in
+ * the package spec, so the suffix is replaced; an identical version leaves the spec untouched.
+ */
+function applyPinnedVersionToAgent(
+  agent: AcpRegistryAgent,
+  pinnedVersion: string,
+): AcpRegistryAgent {
+  if (agent.version === pinnedVersion) return agent;
+  const rewritePackageSpec = (spec: string, distribution: "npx" | "uvx"): string => {
+    const parsed = distribution === "npx" ? parseNpxPackageSpec(spec) : parseUvxPackageSpec(spec);
+    if (parsed.version === pinnedVersion) return spec;
+    return distribution === "npx"
+      ? `${parsed.name}@${pinnedVersion}`
+      : `${parsed.name}==${pinnedVersion}`;
+  };
+  return {
+    ...agent,
+    version: pinnedVersion,
+    distribution: {
+      ...agent.distribution,
+      ...(agent.distribution.npx === undefined
+        ? {}
+        : {
+            npx: {
+              ...agent.distribution.npx,
+              package: rewritePackageSpec(agent.distribution.npx.package, "npx"),
+            },
+          }),
+      ...(agent.distribution.uvx === undefined
+        ? {}
+        : {
+            uvx: {
+              ...agent.distribution.uvx,
+              package: rewritePackageSpec(agent.distribution.uvx.package, "uvx"),
+            },
+          }),
+    },
+  };
+}
 
 export const AcpRegistryErrorReason = AcpRegistryOperationErrorReason;
 export type AcpRegistryErrorReason = typeof AcpRegistryErrorReason.Type;
@@ -537,6 +671,27 @@ export class AcpRegistryCatalog extends Context.Service<
     readonly uninstallManagedBinary: (
       input: AcpRegistryManagedBinaryUninstallInput,
     ) => Effect.Effect<AcpRegistryManagedBinaryUninstallResult, AcpRegistryError>;
+    /** Reads the remote registry index without touching registry.json or installing anything. */
+    readonly checkRemoteUpdates?: () => Effect.Effect<AcpRegistryRemoteUpdates, AcpRegistryError>;
+    /** Enumerates the installed versions of one managed agent with their sizes and active pin. */
+    readonly listManagedVersions?: (
+      agentId: string,
+    ) => Effect.Effect<AcpRegistryManagedVersions, AcpRegistryError>;
+    /** Installs the registry's current version and pins it active, optionally pruning it. */
+    readonly updateAgentToLatest?: (input: {
+      readonly agentId: string;
+      readonly pruneOldVersions?: boolean;
+    }) => Effect.Effect<AcpRegistryVersionUpdateResult, AcpRegistryError>;
+    /** Pins an already installed version of one managed agent. */
+    readonly switchAgentVersion?: (input: {
+      readonly agentId: string;
+      readonly version: string;
+    }) => Effect.Effect<AcpRegistryVersionSwitchResult, AcpRegistryError>;
+    /** Removes inactive installed versions of one managed agent. */
+    readonly pruneManagedVersions?: (input: {
+      readonly agentId: string;
+      readonly version?: string;
+    }) => Effect.Effect<AcpRegistryPruneResult, AcpRegistryError>;
   }
 >()("@t3tools/provider-acp-registry/server/AcpRegistrySupport/AcpRegistryCatalog") {}
 
@@ -882,7 +1037,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
       Effect.ignore,
     );
 
-  const fetchRegistry = Effect.fn("AcpRegistryCatalog.fetchRegistry")(function* () {
+  const requestRegistryText = Effect.fn("AcpRegistryCatalog.requestRegistryText")(function* () {
     yield* assertHttpsUrl(registryUrl, "ACP Registry index URL must use HTTPS.");
     const response = yield* httpClient.execute(HttpClientRequest.get(registryUrl)).pipe(
       Effect.flatMap(HttpClientResponse.filterStatusOk),
@@ -940,8 +1095,13 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
         detail: "ACP Registry index is not valid UTF-8.",
       });
     }
-    const registry = yield* decodeRegistryText(collected.text);
-    yield* writeRegistryCache(collected.text);
+    return collected.text;
+  });
+
+  const fetchRegistry = Effect.fn("AcpRegistryCatalog.fetchRegistry")(function* () {
+    const text = yield* requestRegistryText();
+    const registry = yield* decodeRegistryText(text);
+    yield* writeRegistryCache(text);
     return registry;
   });
 
@@ -1737,6 +1897,565 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
     return distribution;
   });
 
+  const activeVersionsPath = path.join(registryDirectory, "active-versions.json");
+  const remoteUpdatesPath = path.join(registryDirectory, "remote-updates.json");
+  const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const versionDirectoryFor = (agentId: string, version: string) =>
+    path.join(installsDirectory, agentId, encodeURIComponent(version));
+
+  const stateError = (detail: string, cause?: unknown) =>
+    cause === undefined
+      ? new AcpRegistryError({ reason: "install_failed", detail })
+      : new AcpRegistryError({ reason: "install_failed", detail, cause });
+
+  const decodeSafeAgentId = (operation: string, rawAgentId: string) =>
+    decodeBoundedAgentId(rawAgentId).pipe(
+      Effect.mapError((cause) =>
+        stateError(`ACP Registry ${operation} received an invalid agent ID.`, cause),
+      ),
+    );
+
+  const decodeSafeVersion = (operation: string, rawVersion: string) =>
+    decodeBoundedVersion(rawVersion).pipe(
+      Effect.mapError((cause) =>
+        stateError(`ACP Registry ${operation} received an invalid version.`, cause),
+      ),
+    );
+
+  const writeJsonAtomic = (filePath: string, text: string) =>
+    random.uuidV4().pipe(
+      Effect.flatMap((id) => {
+        const temporaryPath = `${filePath}.${process.pid}-${id}.tmp`;
+        return fileSystem
+          .makeDirectory(path.dirname(filePath), { recursive: true })
+          .pipe(
+            Effect.andThen(fileSystem.writeFileString(temporaryPath, text)),
+            Effect.andThen(fileSystem.rename(temporaryPath, filePath)),
+            Effect.ensuring(fileSystem.remove(temporaryPath, { force: true }).pipe(Effect.ignore)),
+          );
+      }),
+    );
+
+  const readActiveVersions = Effect.fn("AcpRegistryCatalog.readActiveVersions")(function* () {
+    const file = yield* fileSystem.readFileString(activeVersionsPath).pipe(
+      Effect.flatMap(decodeJson),
+      Effect.flatMap(decodeActiveVersionsFile),
+      Effect.orElseSucceed(() => ({
+        version: ACP_REGISTRY_STATE_VERSION,
+        agents: {} as Record<string, unknown>,
+      })),
+    );
+    const entries = new Map<
+      string,
+      {
+        readonly version: string;
+        readonly distribution: AcpRegistryDistributionKind;
+        readonly updatedAt: string;
+      }
+    >();
+    for (const [rawAgentId, rawEntry] of Object.entries(file.agents)) {
+      const agentId = yield* decodeBoundedAgentId(rawAgentId).pipe(Effect.option);
+      const entry = decodeActiveVersionEntry(rawEntry);
+      if (Option.isNone(agentId) || Option.isNone(entry)) continue;
+      entries.set(agentId.value, entry.value);
+    }
+    return entries;
+  });
+
+  const writeActiveVersion = Effect.fn("AcpRegistryCatalog.writeActiveVersion")(function* (
+    rawAgentId: string,
+    rawVersion: string,
+    distribution: AcpRegistryDistributionKind,
+  ) {
+    const agentId = yield* decodeSafeAgentId("active version write", rawAgentId);
+    const version = yield* decodeSafeVersion("active version write", rawVersion);
+    const current = yield* readActiveVersions();
+    const updatedAt = yield* nowIso;
+    const next = new Map(current);
+    next.set(agentId, { version, distribution, updatedAt });
+    const agents = Object.fromEntries(
+      Array.from(next, ([id, entry]) => [
+        id,
+        {
+          version: entry.version,
+          distribution: entry.distribution,
+          updatedAt: entry.updatedAt,
+        },
+      ]),
+    );
+    yield* writeJsonAtomic(
+      activeVersionsPath,
+      encodeActiveVersionsFile({ version: ACP_REGISTRY_STATE_VERSION, agents }),
+    ).pipe(
+      Effect.mapError((cause) =>
+        stateError(`Could not record the active ACP Registry version for ${agentId}.`, cause),
+      ),
+    );
+  });
+
+  const readRemoteUpdates = Effect.fn("AcpRegistryCatalog.readRemoteUpdates")(function* () {
+    const file = yield* fileSystem.readFileString(remoteUpdatesPath).pipe(
+      Effect.flatMap(decodeJson),
+      Effect.flatMap(decodeRemoteUpdatesFile),
+      Effect.orElseSucceed(() => ({
+        version: ACP_REGISTRY_STATE_VERSION,
+        checkedAt: "",
+        agents: {} as Record<string, unknown>,
+      })),
+    );
+    const agents = new Map<
+      string,
+      { readonly latestVersion: string; readonly distribution: AcpRegistryDistributionKind }
+    >();
+    for (const [rawAgentId, rawEntry] of Object.entries(file.agents)) {
+      const agentId = yield* decodeBoundedAgentId(rawAgentId).pipe(Effect.option);
+      const entry = decodeRemoteUpdateEntry(rawEntry);
+      if (Option.isNone(agentId) || Option.isNone(entry)) continue;
+      agents.set(agentId.value, entry.value);
+    }
+    return { checkedAt: file.checkedAt.length > 0 ? file.checkedAt : null, agents };
+  });
+
+  const writeRemoteUpdates = Effect.fn("AcpRegistryCatalog.writeRemoteUpdates")(function* (
+    checkedAt: string,
+    agents: ReadonlyMap<
+      string,
+      { readonly latestVersion: string; readonly distribution: AcpRegistryDistributionKind }
+    >,
+  ) {
+    const encoded = Object.fromEntries(
+      Array.from(agents, ([agentId, entry]) => [
+        agentId,
+        { latestVersion: entry.latestVersion, distribution: entry.distribution },
+      ]),
+    );
+    yield* writeJsonAtomic(
+      remoteUpdatesPath,
+      encodeRemoteUpdatesFile({ version: ACP_REGISTRY_STATE_VERSION, checkedAt, agents: encoded }),
+    ).pipe(
+      Effect.mapError((cause) => stateError("Could not record ACP Registry update checks.", cause)),
+    );
+  });
+
+  const writeRemoteUpdateEntry = Effect.fn("AcpRegistryCatalog.writeRemoteUpdateEntry")(function* (
+    agentId: string,
+    latestVersion: string,
+    distribution: AcpRegistryDistributionKind,
+  ) {
+    const remote = yield* readRemoteUpdates();
+    const agents = new Map(remote.agents);
+    agents.set(agentId, { latestVersion, distribution });
+    yield* writeRemoteUpdates(yield* nowIso, agents);
+  });
+
+  const directorySizeBytes = Effect.fn("AcpRegistryCatalog.directorySizeBytes")(function* (
+    directory: string,
+  ): Effect.fn.Return<number, never, never> {
+    const info = yield* fileSystem.stat(directory).pipe(Effect.option);
+    if (Option.isNone(info)) return 0;
+    if (info.value.type === "File") return Number(info.value.size);
+    if (info.value.type !== "Directory") return 0;
+    const entries = yield* fileSystem
+      .readDirectory(directory)
+      .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+    let total = 0;
+    for (const entry of entries) {
+      total += yield* directorySizeBytes(path.join(directory, entry));
+    }
+    return total;
+  });
+
+  const hasNonEmptyDirectory = Effect.fn("AcpRegistryCatalog.hasNonEmptyDirectory")(function* (
+    directory: string,
+  ) {
+    const info = yield* fileSystem.stat(directory).pipe(Effect.option);
+    if (Option.isNone(info) || info.value.type !== "Directory") return false;
+    const entries = yield* fileSystem
+      .readDirectory(directory)
+      .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+    return entries.some((entry) => !entry.startsWith("."));
+  });
+
+  const versionDirectoryHasIntactInstall = Effect.fn(
+    "AcpRegistryCatalog.versionDirectoryHasIntactInstall",
+  )(function* (directory: string) {
+    const exists = (candidate: string) =>
+      fileSystem.exists(candidate).pipe(Effect.orElseSucceed(() => false));
+    if (
+      (yield* exists(path.join(directory, "npm", "package.json"))) ||
+      (yield* hasNonEmptyDirectory(path.join(directory, "npm", "node_modules"))) ||
+      (yield* hasNonEmptyDirectory(path.join(directory, "npm", "lib", "node_modules")))
+    ) {
+      return "npx" as const;
+    }
+    if (yield* exists(path.join(directory, "python"))) return "uvx" as const;
+    for (const target of resolveAcpRegistryPlatformTargetCandidates(platformTarget)) {
+      if (yield* exists(path.join(directory, target))) return "binary" as const;
+    }
+    return undefined;
+  });
+
+  const listPackageReceiptsForAgent = Effect.fn("AcpRegistryCatalog.listPackageReceiptsForAgent")(
+    function* (agentId: string) {
+      const files = yield* fileSystem
+        .readDirectory(packageReceiptsDirectory)
+        .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+      const receipts: Array<{ receipt: AcpRegistryPackageInstallReceipt; modifiedAt: number }> = [];
+      for (const file of files) {
+        if (!file.startsWith(`${agentId}-`) || !file.endsWith(".json")) continue;
+        const receiptPath = path.join(packageReceiptsDirectory, file);
+        const receipt = yield* fileSystem.readFileString(receiptPath).pipe(
+          Effect.map(decodePackageInstallReceipt),
+          Effect.orElseSucceed(() => Option.none()),
+        );
+        if (Option.isNone(receipt) || receipt.value.agentId !== agentId) continue;
+        const info = yield* fileSystem.stat(receiptPath).pipe(Effect.option);
+        const modifiedAt =
+          Option.isSome(info) && Option.isSome(info.value.mtime)
+            ? info.value.mtime.value.getTime()
+            : 0;
+        receipts.push({ receipt: receipt.value, modifiedAt });
+      }
+      return receipts
+        .toSorted((left, right) => right.modifiedAt - left.modifiedAt)
+        .map((entry) => entry.receipt);
+    },
+  );
+
+  // The active pin lives on disk because two catalogs share these directories in one server.
+  const resolveActivePinnedVersion = Effect.fn("AcpRegistryCatalog.resolveActivePinnedVersion")(
+    function* (agentId: string) {
+      const pinned = (yield* readActiveVersions()).get(agentId);
+      if (pinned !== undefined) {
+        const installed = yield* versionDirectoryHasIntactInstall(
+          versionDirectoryFor(agentId, pinned.version),
+        );
+        if (installed !== undefined) return pinned.version;
+      }
+      const receipts = yield* listPackageReceiptsForAgent(agentId);
+      for (const receipt of receipts) {
+        const installed = yield* versionDirectoryHasIntactInstall(
+          versionDirectoryFor(agentId, receipt.agentVersion),
+        );
+        if (installed !== undefined) return receipt.agentVersion;
+      }
+      return undefined;
+    },
+  );
+
+  const pruneFailureReason = (error: unknown): AcpRegistryPruneSkipReason => {
+    const record = error as {
+      readonly code?: unknown;
+      readonly reason?: { readonly _tag?: unknown };
+    } | null;
+    const reasonTag = record?.reason?._tag;
+    const code = record?.code;
+    return reasonTag === "PermissionDenied" ||
+      reasonTag === "Busy" ||
+      code === "EBUSY" ||
+      code === "EPERM"
+      ? "in_use"
+      : "failed";
+  };
+
+  const pruneManagedVersionsUnlocked = Effect.fn("AcpRegistryCatalog.pruneManagedVersionsUnlocked")(
+    function* (agentId: string, rawVersion: string | undefined) {
+      const activeVersion = (yield* resolveActivePinnedVersion(agentId)) ?? null;
+      const deleted: Array<{ version: string; sizeBytes: number }> = [];
+      const skipped: Array<{ version: string; reason: AcpRegistryPruneSkipReason }> = [];
+      if (rawVersion !== undefined && rawVersion === activeVersion) {
+        return {
+          deleted,
+          reclaimedBytes: 0,
+          skipped: [{ version: rawVersion, reason: "active" as const }],
+        } satisfies AcpRegistryPruneResult;
+      }
+
+      const agentRoot = path.join(installsDirectory, agentId);
+      const rootInfo = yield* fileSystem.stat(agentRoot).pipe(Effect.option);
+      if (Option.isNone(rootInfo) || rootInfo.value.type !== "Directory") {
+        return rawVersion === undefined
+          ? ({ deleted, reclaimedBytes: 0, skipped } satisfies AcpRegistryPruneResult)
+          : ({
+              deleted,
+              reclaimedBytes: 0,
+              skipped: [{ version: rawVersion, reason: "not_found" as const }],
+            } satisfies AcpRegistryPruneResult);
+      }
+
+      let candidates: Array<{ version: string; directory: string }>;
+      if (rawVersion !== undefined) {
+        const directory = versionDirectoryFor(agentId, rawVersion);
+        const info = yield* fileSystem.stat(directory).pipe(Effect.option);
+        if (Option.isNone(info) || info.value.type !== "Directory") {
+          return {
+            deleted,
+            reclaimedBytes: 0,
+            skipped: [{ version: rawVersion, reason: "not_found" as const }],
+          } satisfies AcpRegistryPruneResult;
+        }
+        candidates = [{ version: rawVersion, directory }];
+      } else {
+        const names = yield* fileSystem
+          .readDirectory(agentRoot)
+          .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+        candidates = [];
+        for (const name of names) {
+          const version = parseVersionDirectoryName(name);
+          if (version === undefined || version === activeVersion) continue;
+          candidates.push({ version, directory: path.join(agentRoot, name) });
+        }
+      }
+
+      const rootIsSymlink = Option.isSome(
+        yield* fileSystem.readLink(agentRoot).pipe(Effect.option),
+      );
+      if (rootIsSymlink) {
+        return {
+          deleted,
+          reclaimedBytes: 0,
+          skipped: [
+            ...skipped,
+            ...candidates.map((candidate) => ({
+              version: candidate.version,
+              reason: "failed" as const,
+            })),
+          ],
+        } satisfies AcpRegistryPruneResult;
+      }
+
+      const realRoot = yield* fileSystem
+        .realPath(agentRoot)
+        .pipe(Effect.orElseSucceed(() => agentRoot));
+      let reclaimedBytes = 0;
+      for (const candidate of candidates) {
+        const targetIsSymlink = Option.isSome(
+          yield* fileSystem.readLink(candidate.directory).pipe(Effect.option),
+        );
+        const realTarget = yield* fileSystem.realPath(candidate.directory).pipe(Effect.option);
+        if (
+          targetIsSymlink ||
+          Option.isNone(realTarget) ||
+          realTarget.value === realRoot ||
+          !realTarget.value.startsWith(`${realRoot}${path.sep}`)
+        ) {
+          skipped.push({ version: candidate.version, reason: "failed" });
+          continue;
+        }
+        const sizeBytes = yield* directorySizeBytes(candidate.directory);
+        const removed = yield* fileSystem
+          .remove(candidate.directory, { recursive: true, force: true })
+          .pipe(
+            Effect.as(true),
+            Effect.catch((error) => {
+              skipped.push({ version: candidate.version, reason: pruneFailureReason(error) });
+              return Effect.succeed(false);
+            }),
+          );
+        if (!removed) continue;
+        deleted.push({ version: candidate.version, sizeBytes });
+        reclaimedBytes += sizeBytes;
+      }
+      return { deleted, reclaimedBytes, skipped } satisfies AcpRegistryPruneResult;
+    },
+  );
+
+  const rewritePackageReceiptsForVersion = Effect.fn(
+    "AcpRegistryCatalog.rewritePackageReceiptsForVersion",
+  )(function* (agentId: string, version: string, distribution: "npx" | "uvx") {
+    const receipts = yield* listPackageReceiptsForAgent(agentId);
+    const replaceVersionSegment = (value: string, from: string, to: string) =>
+      value
+        .split(`${path.sep}${encodeURIComponent(from)}${path.sep}`)
+        .join(`${path.sep}${encodeURIComponent(to)}${path.sep}`);
+    for (const receipt of receipts) {
+      if (receipt.distribution !== distribution || receipt.agentVersion === version) continue;
+      const packageSpec =
+        distribution === "npx"
+          ? `${parseNpxPackageSpec(receipt.packageSpec).name}@${version}`
+          : `${parseUvxPackageSpec(receipt.packageSpec).name}==${version}`;
+      const nextReceipt: AcpRegistryPackageInstallReceipt = {
+        ...receipt,
+        agentVersion: version,
+        packageSpec,
+        binDirectory: replaceVersionSegment(receipt.binDirectory, receipt.agentVersion, version),
+        executablePath: replaceVersionSegment(
+          receipt.executablePath,
+          receipt.agentVersion,
+          version,
+        ),
+        ...(receipt.packageRoot === undefined
+          ? {}
+          : {
+              packageRoot: replaceVersionSegment(
+                receipt.packageRoot,
+                receipt.agentVersion,
+                version,
+              ),
+            }),
+        ...(receipt.packageVersion === undefined ? {} : { packageVersion: version }),
+      };
+      const executableExists = yield* fileSystem
+        .exists(nextReceipt.executablePath)
+        .pipe(Effect.orElseSucceed(() => false));
+      if (!executableExists) continue;
+      yield* writePackageReceipt(nextReceipt);
+    }
+  });
+
+  const checkRemoteUpdates = Effect.fn("AcpRegistryCatalog.checkRemoteUpdates")(function* () {
+    const text = yield* requestRegistryText();
+    const registry = yield* decodeRegistryText(text);
+    const checkedAt = yield* nowIso;
+    const entries = new Map<
+      string,
+      { readonly latestVersion: string; readonly distribution: AcpRegistryDistributionKind }
+    >();
+    for (const agent of registry.agents) {
+      const distribution = resolveAcpRegistryDistribution({
+        agent,
+        preference: "auto",
+        platformTarget,
+      });
+      if (distribution === undefined) continue;
+      entries.set(agent.id, {
+        latestVersion: agent.version,
+        distribution: distribution.kind,
+      });
+    }
+    yield* writeRemoteUpdates(checkedAt, entries);
+    return {
+      checkedAt,
+      agents: Array.from(entries, ([agentId, entry]) => ({ agentId, ...entry })),
+    } satisfies AcpRegistryRemoteUpdates;
+  });
+
+  const listManagedVersions = Effect.fn("AcpRegistryCatalog.listManagedVersions")(function* (
+    rawAgentId: string,
+  ) {
+    const agentId = yield* decodeSafeAgentId("inventory", rawAgentId);
+    const agentRoot = path.join(installsDirectory, agentId);
+    const directoryNames = yield* fileSystem
+      .readDirectory(agentRoot)
+      .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+    const versions: Array<AcpRegistryManagedVersion> = [];
+    for (const directoryName of directoryNames) {
+      const decodedVersion = parseVersionDirectoryName(directoryName);
+      if (decodedVersion === undefined) continue;
+      const version = yield* decodeBoundedVersion(decodedVersion).pipe(Effect.option);
+      if (Option.isNone(version)) continue;
+      const directory = path.join(agentRoot, directoryName);
+      const info = yield* fileSystem.stat(directory).pipe(Effect.option);
+      if (Option.isNone(info) || info.value.type !== "Directory") continue;
+      const distribution = yield* versionDirectoryHasIntactInstall(directory);
+      if (distribution === undefined) continue;
+      versions.push({
+        id: directoryName,
+        version: version.value,
+        sizeBytes: yield* directorySizeBytes(directory),
+        isActive: false,
+        installedAt: Option.isSome(info.value.mtime) ? info.value.mtime.value.toISOString() : null,
+        path: directory,
+        distribution,
+      });
+    }
+    versions.sort((left, right) => compareSemverVersions(right.version, left.version));
+    const pinned = yield* resolveActivePinnedVersion(agentId);
+    const activeVersion = pinned ?? versions[0]?.version ?? null;
+    const remote = yield* readRemoteUpdates();
+    const remoteEntry = remote.agents.get(agentId);
+    return {
+      agentId,
+      activeVersion,
+      latestVersion: remoteEntry?.latestVersion ?? null,
+      lastCheckedAt: remote.checkedAt,
+      distribution:
+        versions.find((entry) => entry.version === activeVersion)?.distribution ??
+        remoteEntry?.distribution ??
+        null,
+      versions: versions.map((entry) => ({
+        ...entry,
+        isActive: entry.version === activeVersion,
+      })),
+    } satisfies AcpRegistryManagedVersions;
+  });
+
+  const updateAgentToLatest = Effect.fn("AcpRegistryCatalog.updateAgentToLatest")(
+    function* (input: { readonly agentId: string; readonly pruneOldVersions?: boolean }) {
+      const agentId = yield* decodeSafeAgentId("update", input.agentId);
+      return yield* withInstallPermit(agentId)(
+        Effect.gen(function* () {
+          const previousVersion = (yield* resolveActivePinnedVersion(agentId)) ?? null;
+          const registry = yield* refreshRegistry();
+          const agent = yield* findAgent(registry, agentId);
+          const distribution = yield* compatibleDistribution(agent, "auto");
+          if (distribution.kind === "binary") {
+            yield* installBinary(agent, distribution.binaryTarget!);
+          } else {
+            yield* ensureGlobalPackage(
+              agent,
+              distribution.kind,
+              distribution.packageName!,
+              hostEnvironment,
+            );
+          }
+          yield* writeActiveVersion(agentId, agent.version, distribution.kind);
+          yield* writeRemoteUpdateEntry(agentId, agent.version, distribution.kind);
+          let prunedVersions: ReadonlyArray<string> = [];
+          let reclaimedBytes = 0;
+          if (input.pruneOldVersions === true) {
+            const pruned = yield* pruneManagedVersionsUnlocked(agentId, undefined);
+            prunedVersions = pruned.deleted.map((entry) => entry.version);
+            reclaimedBytes = pruned.reclaimedBytes;
+          }
+          return {
+            previousVersion,
+            activeVersion: agent.version,
+            prunedVersions,
+            reclaimedBytes,
+          } satisfies AcpRegistryVersionUpdateResult;
+        }),
+      );
+    },
+  );
+
+  const switchAgentVersion = Effect.fn("AcpRegistryCatalog.switchAgentVersion")(function* (input: {
+    readonly agentId: string;
+    readonly version: string;
+  }) {
+    const agentId = yield* decodeSafeAgentId("switch", input.agentId);
+    const version = yield* decodeSafeVersion("switch", input.version);
+    return yield* withInstallPermit(agentId)(
+      Effect.gen(function* () {
+        const previousVersion = (yield* resolveActivePinnedVersion(agentId)) ?? null;
+        const directory = versionDirectoryFor(agentId, version);
+        const distribution = yield* versionDirectoryHasIntactInstall(directory);
+        if (distribution === undefined) {
+          return yield* stateError(
+            `ACP Registry agent ${agentId} has no complete ${version} installation to switch to.`,
+          );
+        }
+        if (distribution === "npx" || distribution === "uvx") {
+          yield* rewritePackageReceiptsForVersion(agentId, version, distribution);
+        }
+        yield* writeActiveVersion(agentId, version, distribution);
+        return {
+          previousVersion,
+          activeVersion: version,
+        } satisfies AcpRegistryVersionSwitchResult;
+      }),
+    );
+  });
+
+  const pruneManagedVersions = Effect.fn("AcpRegistryCatalog.pruneManagedVersions")(
+    function* (input: { readonly agentId: string; readonly version?: string }) {
+      const agentId = yield* decodeSafeAgentId("prune", input.agentId);
+      const version =
+        input.version === undefined ? undefined : yield* decodeSafeVersion("prune", input.version);
+      return yield* withInstallPermit(agentId)(pruneManagedVersionsUnlocked(agentId, version));
+    },
+  );
+
   const search: AcpRegistryCatalog["Service"]["search"] = Effect.fn("AcpRegistryCatalog.search")(
     function* (input) {
       const registry = yield* recentRegistry();
@@ -1794,11 +2513,17 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
         yield* withInstallPermit(agent.id)(
           installBinary(agent, distribution.binaryTarget!).pipe(
             Effect.tap(() => reservePreparedBinary(agent.id)),
+            Effect.andThen(writeActiveVersion(agent.id, agent.version, distribution.kind)),
           ),
         );
       } else {
         yield* withInstallPermit(agent.id)(
-          ensureGlobalPackage(agent, distribution.kind, distribution.packageName!, hostEnvironment),
+          ensureGlobalPackage(
+            agent,
+            distribution.kind,
+            distribution.packageName!,
+            hostEnvironment,
+          ).pipe(Effect.andThen(writeActiveVersion(agent.id, agent.version, distribution.kind))),
         );
       }
       return {
@@ -1839,8 +2564,13 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
       const agentId = settings.agentId.trim();
       if (agentId.length === 0) return { status: "unconfigured" } as const;
       const registry = yield* loadRegistry();
-      const agent = registry.agents.find((candidate) => candidate.id === agentId);
-      if (agent === undefined) return { status: "not_found", agentId } as const;
+      const registryAgent = registry.agents.find((candidate) => candidate.id === agentId);
+      if (registryAgent === undefined) return { status: "not_found", agentId } as const;
+      const pinnedVersion = yield* resolveActivePinnedVersion(registryAgent.id);
+      const agent =
+        pinnedVersion === undefined
+          ? registryAgent
+          : applyPinnedVersionToAgent(registryAgent, pinnedVersion);
       const documentationUrl = agent.website ?? agent.repository;
       const distribution = resolveAcpRegistryDistribution({
         agent,
@@ -1952,7 +2682,10 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
       });
     }
     const agent = yield* findAgent(registry, agentId);
-    const distribution = yield* compatibleDistribution(agent, settings.distribution);
+    const pinnedVersion = yield* resolveActivePinnedVersion(agent.id);
+    const effectiveAgent =
+      pinnedVersion === undefined ? agent : applyPinnedVersionToAgent(agent, pinnedVersion);
+    const distribution = yield* compatibleDistribution(effectiveAgent, settings.distribution);
 
     let command: string;
     let args: ReadonlyArray<string>;
@@ -1964,15 +2697,15 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
       if (resolvedOverride === undefined) {
         return yield* new AcpRegistryError({
           reason: "runner_unavailable",
-          detail: `ACP Registry agent ${agent.id} requires '${commandOverride}', but it is not available on this provider instance's PATH.`,
+          detail: `ACP Registry agent ${effectiveAgent.id} requires '${commandOverride}', but it is not available on this provider instance's PATH.`,
         });
       }
       command = resolvedOverride;
       args = distribution.args;
     } else if (distribution.kind === "npx" || distribution.kind === "uvx") {
-      const installed = yield* withInstallPermit(agent.id)(
+      const installed = yield* withInstallPermit(effectiveAgent.id)(
         ensureGlobalPackage(
-          agent,
+          effectiveAgent,
           distribution.kind,
           distribution.packageName!,
           effectiveEnvironment,
@@ -1983,9 +2716,9 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
       commandBinDirectory = installed.binDirectory;
     } else {
       const target = distribution.binaryTarget!;
-      command = yield* withInstallPermit(agent.id)(
-        installBinary(agent, target).pipe(
-          Effect.tap(() => consumePreparedBinaryReservation(agent.id)),
+      command = yield* withInstallPermit(effectiveAgent.id)(
+        installBinary(effectiveAgent, target).pipe(
+          Effect.tap(() => consumePreparedBinaryReservation(effectiveAgent.id)),
         ),
       );
       args = distribution.args;
@@ -2157,5 +2890,10 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
     inspect,
     resolve,
     uninstallManagedBinary,
+    checkRemoteUpdates,
+    listManagedVersions,
+    updateAgentToLatest,
+    switchAgentVersion,
+    pruneManagedVersions,
   });
 });

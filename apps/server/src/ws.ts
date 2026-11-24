@@ -83,6 +83,7 @@ import {
   ProjectSearchEntriesError,
   ProjectWriteFileError,
   ProjectMutationError,
+  ProviderRuntimeMaintenanceError,
   ProviderUploadFeedbackError,
   ProviderSetupError,
   RelayClientInstallFailedError,
@@ -190,6 +191,7 @@ import * as AcpRegistryRuntimeCoordinator from "@t3tools/provider-acp-registry/s
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ProviderAuthService from "./provider/ProviderAuthService.ts";
 import * as ProviderInstallation from "./provider/providerInstallation.ts";
+import * as ProviderRuntimeMaintenance from "./provider/ProviderRuntimeMaintenance.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as NpmRelease from "./cloud/npmRelease.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -1561,6 +1563,10 @@ export const layerWsRpc = (
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const providerAuth = yield* ProviderAuthService.ProviderAuthService;
       const providerInstallation = yield* ProviderInstallation.ProviderInstallation;
+      // Optional so tests and embedded hosts without the provider runtime layer still serve RPCs.
+      const providerRuntimeMaintenance = yield* Effect.serviceOption(
+        ProviderRuntimeMaintenance.ProviderRuntimeMaintenance,
+      );
       const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const npmRelease = yield* NpmRelease.NpmRelease;
       const config = yield* ServerConfig.ServerConfig;
@@ -1995,6 +2001,14 @@ export const layerWsRpc = (
       const mutateProject = Effect.fn("ws.projects.mutate")(function* (mutation: ProjectMutation) {
         return yield* mutateProjectWithClone(projectService, projectCloneTracker, mutation);
       });
+
+      const providerRuntimeUnavailable = () =>
+        Effect.fail(
+          new ProviderRuntimeMaintenanceError({
+            operation: "unavailable",
+            detail: "Provider runtime maintenance is not available in this server.",
+          }),
+        );
 
       const handlers = ServerWsRpcGroup.of({
         [WS_METHODS.issuesList]: (input) => issues.list(input),
@@ -2507,6 +2521,35 @@ export const layerWsRpc = (
               }),
             ),
           ),
+        [WS_METHODS.serverListProviderRuntimes]: () =>
+          Option.match(providerRuntimeMaintenance, {
+            onNone: providerRuntimeUnavailable,
+            onSome: (maintenance) => maintenance.listRuntimes(),
+          }),
+        [WS_METHODS.serverCheckProviderRuntimeUpdates]: (input) =>
+          Option.match(providerRuntimeMaintenance, {
+            onNone: providerRuntimeUnavailable,
+            onSome: (maintenance) => maintenance.checkUpdates(input),
+          }),
+        [WS_METHODS.serverUpdateProviderRuntime]: (input) =>
+          Effect.annotateCurrentSpan({ "provider.runtime_id": input.runtimeId }).pipe(
+            Effect.andThen(
+              Option.match(providerRuntimeMaintenance, {
+                onNone: providerRuntimeUnavailable,
+                onSome: (maintenance) => maintenance.updateRuntime(input),
+              }),
+            ),
+          ),
+        [WS_METHODS.serverPruneProviderRuntimeVersions]: (input) =>
+          Option.match(providerRuntimeMaintenance, {
+            onNone: providerRuntimeUnavailable,
+            onSome: (maintenance) =>
+              input.runtimeId === undefined
+                ? maintenance.pruneVersions(input)
+                : Effect.annotateCurrentSpan({ "provider.runtime_id": input.runtimeId }).pipe(
+                    Effect.andThen(maintenance.pruneVersions(input)),
+                  ),
+          }),
         [WS_METHODS.serverRefreshProviders]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {

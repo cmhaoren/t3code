@@ -710,6 +710,8 @@ interface ProviderInstanceCardProps {
   readonly liveProvider: ServerProvider | undefined;
   readonly mode: "list" | "editor";
   readonly selected?: boolean | undefined;
+  readonly treeChild?: boolean | undefined;
+  readonly parentVersionLabel?: string | null | undefined;
   readonly onSelect?: (() => void) | undefined;
   readonly readOnly?: boolean | undefined;
   readonly canWriteSettings?: boolean;
@@ -784,6 +786,8 @@ export function ProviderInstanceCard({
   liveProvider,
   mode,
   selected = false,
+  treeChild = false,
+  parentVersionLabel = null,
   onSelect,
   readOnly = false,
   canWriteSettings = true,
@@ -825,6 +829,8 @@ export function ProviderInstanceCard({
       ? (providerAuthLabel(liveProvider.auth, m) ?? null)
       : null;
   const versionLabel = getProviderVersionLabel(liveProvider?.version);
+  // A tree child inherits its group's version; repeat it only when this instance differs.
+  const rowVersionLabel = treeChild && versionLabel === parentVersionLabel ? null : versionLabel;
   const versionAdvisory = getProviderVersionAdvisoryPresentation(
     liveProvider?.versionAdvisory,
     liveProvider?.compatibilityAdvisory,
@@ -1175,7 +1181,8 @@ export function ProviderInstanceCard({
       <div
         data-slot="settings-row"
         className={cn(
-          "group relative flex min-h-18 items-center gap-3 px-3 py-3 transition-colors sm:px-4",
+          "group relative flex items-center gap-3 transition-colors",
+          treeChild ? "min-h-13 py-2 pr-3 pl-4 sm:pr-4" : "min-h-18 px-3 py-3 sm:px-4",
           selected ? "bg-foreground/[0.06]" : "hover:bg-muted/25",
         )}
       >
@@ -1192,13 +1199,20 @@ export function ProviderInstanceCard({
             aria-label={gt("Select {provider}", { provider: displayName })}
             aria-pressed={selected}
           />
-          {titleIconNode}
+          {treeChild ? null : titleIconNode}
           <span className="min-w-0 flex-1">
             <span className="flex min-w-0 items-center gap-2">
+              {treeChild && accentColor ? (
+                <span
+                  className="size-2 shrink-0 rounded-full"
+                  style={{ backgroundColor: accentColor }}
+                  aria-hidden
+                />
+              ) : null}
               <span className="truncate text-sm font-medium text-foreground">{displayName}</span>
-              {versionLabel ? (
+              {rowVersionLabel ? (
                 <code className="max-w-24 shrink-0 truncate text-xs text-muted-foreground">
-                  {versionLabel}
+                  {rowVersionLabel}
                 </code>
               ) : null}
               {versionAdvisoryNode}

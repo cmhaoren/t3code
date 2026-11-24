@@ -33,6 +33,10 @@ const state = vi.hoisted(() => ({
   updateProvider: vi.fn(),
   uninstall: vi.fn(),
   acceptUrlAuth: vi.fn(),
+  listProviderRuntimes: vi.fn(),
+  checkProviderRuntimeUpdates: vi.fn(),
+  updateProviderRuntime: vi.fn(),
+  pruneProviderRuntimeVersions: vi.fn(),
   updateSettings: vi.fn(),
   updateModelPreferences: vi.fn(),
   toggleFavorite: vi.fn(),
@@ -53,6 +57,10 @@ vi.mock(import("../../state/server"), async (original) => {
     updateProvider: "update",
     uninstallAcpRegistryManagedBinary: "uninstall",
     acceptAcpRegistryUrlAuth: "accept-url-auth",
+    listProviderRuntimes: "provider-runtime:list",
+    checkProviderRuntimeUpdates: "provider-runtime:check",
+    updateProviderRuntime: "provider-runtime:update",
+    pruneProviderRuntimeVersions: "provider-runtime:prune",
   } as const;
   const labelled = Object.fromEntries(
     Object.entries(commandLabels).map(([key, label]) => [
@@ -80,6 +88,10 @@ vi.mock(import("../../state/use-atom-command"), async (original) => ({
       update: state.updateProvider,
       uninstall: state.uninstall,
       "accept-url-auth": state.acceptUrlAuth,
+      "provider-runtime:list": state.listProviderRuntimes,
+      "provider-runtime:check": state.checkProviderRuntimeUpdates,
+      "provider-runtime:update": state.updateProviderRuntime,
+      "provider-runtime:prune": state.pruneProviderRuntimeVersions,
     })[command.label ?? ""] ?? vi.fn()) as never,
 }));
 vi.mock(import("~/localApi"), async (original) => {
@@ -205,6 +217,14 @@ function provider(): ServerProvider {
 const setProviders = (providers: ReadonlyArray<ServerProvider>) =>
   act(async () => appAtomRegistry.set(state.providers, providers));
 
+const EMPTY_RUNTIME_INVENTORY = {
+  checkedAt: "2026-11-24T00:00:00.000Z",
+  totalSizeBytes: 0,
+  reclaimableBytes: 0,
+  autoPruneOldVersions: false,
+  runtimes: [],
+};
+
 function panel(options?: {
   readonly readOnly?: boolean;
   readonly targetInstanceId?: ProviderInstanceId;
@@ -246,6 +266,14 @@ async function setup() {
   state.updateProvider.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   state.uninstall.mockReset().mockResolvedValue(AsyncResult.success({}));
   state.acceptUrlAuth.mockReset().mockResolvedValue(AsyncResult.success({ accepted: true }));
+  state.listProviderRuntimes
+    .mockReset()
+    .mockResolvedValue(AsyncResult.success(EMPTY_RUNTIME_INVENTORY));
+  state.checkProviderRuntimeUpdates
+    .mockReset()
+    .mockResolvedValue(AsyncResult.success(EMPTY_RUNTIME_INVENTORY));
+  state.updateProviderRuntime.mockReset();
+  state.pruneProviderRuntimeVersions.mockReset();
   await setProviders([]);
 }
 
@@ -480,6 +508,213 @@ describe("EnvironmentProviderSettings provider list", () => {
     await userEvent.click(row, { position: { x: 3, y: 3 } });
 
     await expect.element(select).toHaveAttribute("aria-pressed", "true");
+  });
+});
+
+describe("EnvironmentProviderSettings provider tree", () => {
+  const codex = ProviderDriverKind.make("codex");
+  const claude = ProviderDriverKind.make("claudeAgent");
+  const antigravity = ProviderDriverKind.make("antigravity");
+  const acp = ProviderDriverKind.make("acpRegistry");
+  const cursor = ProviderDriverKind.make("cursor");
+  const codexId = ProviderInstanceId.make("codex");
+  const claudeId = ProviderInstanceId.make("claudeAgent");
+  const antigravityId = ProviderInstanceId.make("antigravity");
+  const antigravityWorkId = ProviderInstanceId.make("antigravity_work");
+  const codexWorkId = ProviderInstanceId.make("codex_work");
+  const droidAId = ProviderInstanceId.make("droid-a");
+  const droidBId = ProviderInstanceId.make("droid-b");
+  const cursorId = ProviderInstanceId.make("cursor");
+
+  function treeSettings(): UnifiedSettings {
+    return {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: {
+        [codexId]: { driver: codex, enabled: false },
+        [codexWorkId]: { driver: codex, enabled: false, displayName: "Codex Work" },
+        [claudeId]: { driver: claude, enabled: false },
+        [antigravityId]: {
+          driver: antigravity,
+          enabled: true,
+          config: { binaryPath: "/opt/antigravity/bin/agy" },
+        },
+        [antigravityWorkId]: {
+          driver: antigravity,
+          enabled: false,
+          displayName: "Antigravity Work",
+        },
+        [droidAId]: {
+          driver: acp,
+          enabled: true,
+          displayName: "Droid A",
+          config: { agentId: "factory-droid" },
+        },
+        [droidBId]: {
+          driver: acp,
+          enabled: false,
+          displayName: "Droid B",
+          config: { agentId: "factory-droid" },
+        },
+      },
+    };
+  }
+
+  it("groups multi-instance agents into collapsible headers with enabled counts", async () => {
+    await setup();
+    state.settings = treeSettings();
+    await using screen = await render(panel());
+
+    const groups = Array.from(
+      screen.container.querySelectorAll("[data-provider-tree-group]"),
+      (group) => group.getAttribute("data-provider-tree-group"),
+    );
+    expect(groups).toEqual(["driver:antigravity", "acp:factory-droid", "driver:codex"]);
+
+    const header = (groupKey: string) =>
+      screen.container.querySelector(
+        `[data-provider-tree-group="${groupKey}"] button`,
+      ) as HTMLButtonElement;
+
+    expect(header("driver:antigravity").getAttribute("aria-expanded")).toBe("true");
+    expect(header("driver:antigravity").textContent).toContain("Antigravity");
+    expect(header("driver:antigravity").textContent).toContain("1/2");
+    expect(header("acp:factory-droid").getAttribute("aria-expanded")).toBe("true");
+    expect(header("acp:factory-droid").textContent).toContain("Factory Droid");
+    expect(header("acp:factory-droid").textContent).toContain("1/2");
+    expect(header("driver:codex").getAttribute("aria-expanded")).toBe("false");
+    expect(header("driver:codex").textContent).toContain("0/2");
+
+    const antigravityRows = screen.container.querySelectorAll(
+      '[data-provider-tree-group="driver:antigravity"] [data-slot="settings-row"]',
+    );
+    expect(antigravityRows).toHaveLength(2);
+    expect(antigravityRows[0]?.textContent).not.toContain("Antigravity Work");
+    expect(
+      antigravityRows[0]?.querySelector('button[aria-label="Select Antigravity"]'),
+    ).not.toBeNull();
+    expect(
+      antigravityRows[1]?.querySelector('button[aria-label="Select Antigravity Work"]'),
+    ).not.toBeNull();
+    expect(
+      screen.container.querySelectorAll(
+        '[data-provider-tree-group="driver:codex"] [data-slot="settings-row"]',
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("toggles a group between expanded and collapsed when its header is clicked", async () => {
+    await setup();
+    state.settings = treeSettings();
+    await using screen = await render(panel());
+    const header = page.getByRole("button", { name: /^Antigravity 1\/2$/ });
+    const rows = () =>
+      screen.container.querySelectorAll(
+        '[data-provider-tree-group="driver:antigravity"] [data-slot="settings-row"]',
+      );
+
+    await expect.element(header).toHaveAttribute("aria-expanded", "true");
+    expect(rows()).toHaveLength(2);
+
+    await userEvent.click(header);
+    await expect.element(header).toHaveAttribute("aria-expanded", "false");
+    expect(rows()).toHaveLength(0);
+
+    await userEvent.click(header);
+    await expect.element(header).toHaveAttribute("aria-expanded", "true");
+    expect(rows()).toHaveLength(2);
+  });
+
+  it("renders a single-instance provider flat and above disabled groups", async () => {
+    await setup();
+    state.settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: {
+        [codexId]: { driver: codex, enabled: false },
+        [codexWorkId]: { driver: codex, enabled: false },
+        [cursorId]: {
+          driver: cursor,
+          enabled: true,
+          config: { binaryPath: "/usr/local/bin/cursor-agent" },
+        },
+      },
+    };
+    await setProviders([{ ...provider(), instanceId: cursorId, driver: cursor, version: null }]);
+    await using screen = await render(panel());
+
+    expect(screen.container.querySelector('[data-provider-tree-group="driver:cursor"]')).toBeNull();
+    const blocks = Array.from(
+      screen.container.querySelectorAll('[data-provider-tree-group], [data-slot="settings-row"]'),
+    );
+    const cursorIndex = blocks.findIndex(
+      (block) => block.querySelector('button[aria-label="Select Cursor"]') !== null,
+    );
+    const codexIndex = blocks.findIndex(
+      (block) => block.getAttribute("data-provider-tree-group") === "driver:codex",
+    );
+    expect(cursorIndex).toBeGreaterThanOrEqual(0);
+    expect(codexIndex).toBeGreaterThan(cursorIndex);
+  });
+
+  it("defaults selection to the first enabled provider in sorted order", async () => {
+    await setup();
+    state.settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: {
+        [codexId]: { driver: codex, enabled: false },
+        [claudeId]: { driver: claude, enabled: true },
+      },
+    };
+    await using screen = await render(panel());
+
+    await expect
+      .element(screen.getByRole("heading", { name: "Claude", exact: true }))
+      .toBeVisible();
+    await expect.element(screen.getByRole("switch", { name: "Enable Codex" })).not.toBeChecked();
+  });
+
+  it("keeps an expanded group open after its last enabled instance is switched off", async () => {
+    await setup();
+    const settings = treeSettings();
+    state.settings = settings;
+    await using screen = await render(panel({ targetInstanceId: antigravityId }));
+    const header = screen.getByRole("button", { name: /^Antigravity \d\/2$/ });
+    await expect.element(header).toHaveAttribute("aria-expanded", "true");
+
+    await userEvent.click(screen.getByRole("switch", { name: "Enable Antigravity" }).first());
+    expect(state.mutateProviderInstance).toHaveBeenCalledWith(
+      {
+        operation: "upsert",
+        instanceId: antigravityId,
+        instance: {
+          driver: antigravity,
+          enabled: false,
+          config: { binaryPath: "/opt/antigravity/bin/agy" },
+        },
+      },
+      {},
+    );
+
+    state.settings = {
+      ...settings,
+      providerInstances: {
+        ...settings.providerInstances,
+        [antigravityId]: {
+          ...settings.providerInstances[antigravityId]!,
+          enabled: false,
+        },
+      },
+    };
+    await screen.rerender(panel({ targetInstanceId: antigravityId }));
+
+    await expect.element(header).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.container.querySelectorAll(
+        '[data-provider-tree-group="driver:antigravity"] [data-slot="settings-row"]',
+      ),
+    ).toHaveLength(2);
+    await expect
+      .element(screen.getByRole("heading", { name: "Antigravity", exact: true }))
+      .toBeVisible();
   });
 });
 

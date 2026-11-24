@@ -1798,6 +1798,40 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => `${environmentId}:${input.agentId}`,
       },
     }),
+    listProviderRuntimes: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:provider-runtime:list",
+      tag: WS_METHODS.serverListProviderRuntimes,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
+    checkProviderRuntimeUpdates: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:provider-runtime:check",
+      tag: WS_METHODS.serverCheckProviderRuntimeUpdates,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => `${environmentId}:${input.runtimeId ?? "all"}`,
+      },
+    }),
+    updateProviderRuntime: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:provider-runtime:update",
+      tag: WS_METHODS.serverUpdateProviderRuntime,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          `${environmentId}:${input.runtimeId}:${input.action}:${input.targetVersion ?? "latest"}`,
+      },
+    }),
+    pruneProviderRuntimeVersions: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:provider-runtime:prune",
+      tag: WS_METHODS.serverPruneProviderRuntimeVersions,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) =>
+          `${environmentId}:${input.runtimeId ?? "all"}:${input.version ?? "all"}`,
+      },
+    }),
     acceptAcpRegistryUrlAuth: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:acp-registry:accept-url-auth",
       tag: WS_METHODS.serverAcceptAcpRegistryUrlAuth,

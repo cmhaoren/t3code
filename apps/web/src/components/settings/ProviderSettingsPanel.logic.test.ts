@@ -1,6 +1,7 @@
 import {
   AuthProvidersManageScope,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   type ServerSettings,
 } from "@t3tools/contracts";
@@ -8,7 +9,11 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   buildProviderInstanceOverridePatch,
+  buildProviderInstanceTree,
+  isProviderGroupExpanded,
+  resolveProviderGroupIdentity,
   resolveRemoteOperateAccess,
+  type ProviderInstanceTreeItem,
 } from "./ProviderSettingsPanel.logic";
 
 describe("buildProviderInstanceOverridePatch", () => {
@@ -110,5 +115,412 @@ describe("remote operate access", () => {
         hasError: false,
       }),
     ).toBe("denied");
+  });
+});
+
+const acpDriver = ProviderDriverKind.make("acpRegistry");
+const codexDriver = ProviderDriverKind.make("codex");
+const antigravityDriver = ProviderDriverKind.make("antigravity");
+
+describe("resolveProviderGroupIdentity", () => {
+  it("keys non-ACP drivers by their driver kind", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: codexDriver,
+        config: undefined,
+        driverLabel: "Codex",
+      }),
+    ).toEqual({ groupKey: "driver:codex", groupLabel: "Codex" });
+    expect(
+      resolveProviderGroupIdentity({
+        driver: antigravityDriver,
+        config: { agentId: "factory-droid" },
+        driverLabel: "Antigravity",
+      }),
+    ).toEqual({ groupKey: "driver:antigravity", groupLabel: "Antigravity" });
+  });
+
+  it("keeps local ACP instances together without registry identity", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: { source: "local", agentId: "factory-droid" },
+        driverLabel: "ACP Registry",
+      }),
+    ).toEqual({ groupKey: "acp:local", groupLabel: "Local ACP" });
+  });
+
+  it("names the factory-droid agent and carries its registry icon", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: { agentId: "factory-droid", registryIconUrl: "https://example.com/droid.svg" },
+        driverLabel: "ACP Registry",
+      }),
+    ).toEqual({
+      groupKey: "acp:factory-droid",
+      groupLabel: "Factory Droid",
+      acpRegistryAgentId: "factory-droid",
+      acpRegistryIconUrl: "https://example.com/droid.svg",
+    });
+  });
+
+  it("title-cases other agent ids and trims them", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: { agentId: "  swe_agent-v2 " },
+        driverLabel: "ACP Registry",
+      }),
+    ).toEqual({
+      groupKey: "acp:swe_agent-v2",
+      groupLabel: "Swe Agent V2",
+      acpRegistryAgentId: "swe_agent-v2",
+    });
+  });
+
+  it("falls back to the live icon, then to no icon, then to the driver label", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: { agentId: "qwen-code" },
+        driverLabel: "ACP Registry",
+        liveIconUrl: "https://example.com/live.svg",
+      }),
+    ).toEqual({
+      groupKey: "acp:qwen-code",
+      groupLabel: "Qwen Code",
+      acpRegistryAgentId: "qwen-code",
+      acpRegistryIconUrl: "https://example.com/live.svg",
+    });
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: null,
+        driverLabel: "ACP Registry",
+      }),
+    ).toEqual({ groupKey: "acp:unconfigured", groupLabel: "ACP Registry" });
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: { agentId: "   " },
+        driverLabel: "ACP Registry",
+        liveIconUrl: "   ",
+      }),
+    ).toEqual({ groupKey: "acp:unconfigured", groupLabel: "ACP Registry" });
+  });
+});
+
+function treeItem(input: {
+  readonly instanceId: string;
+  readonly enabled: boolean;
+  readonly groupKey: string;
+  readonly originalIndex: number;
+  readonly driver?: ProviderDriverKind;
+  readonly isDefault?: boolean;
+  readonly groupLabel?: string;
+  readonly versionLabel?: string | null;
+  readonly acpRegistryAgentId?: string;
+  readonly acpRegistryIconUrl?: string;
+}): ProviderInstanceTreeItem<string> {
+  return {
+    row: input.instanceId,
+    instanceId: ProviderInstanceId.make(input.instanceId),
+    driver: input.driver ?? codexDriver,
+    isDefault: input.isDefault ?? false,
+    enabled: input.enabled,
+    groupKey: input.groupKey,
+    groupLabel: input.groupLabel ?? input.groupKey,
+    originalIndex: input.originalIndex,
+    ...(input.versionLabel !== undefined ? { versionLabel: input.versionLabel } : {}),
+    ...(input.acpRegistryAgentId !== undefined
+      ? { acpRegistryAgentId: input.acpRegistryAgentId }
+      : {}),
+    ...(input.acpRegistryIconUrl !== undefined
+      ? { acpRegistryIconUrl: input.acpRegistryIconUrl }
+      : {}),
+  };
+}
+
+describe("buildProviderInstanceTree", () => {
+  it("sorts enabled groups above disabled groups", () => {
+    const groups = buildProviderInstanceTree([
+      treeItem({ instanceId: "codex", enabled: false, groupKey: "driver:codex", originalIndex: 0 }),
+      treeItem({
+        instanceId: "claudeAgent",
+        enabled: true,
+        groupKey: "driver:claudeAgent",
+        originalIndex: 1,
+      }),
+    ]);
+
+    expect(groups.map((group) => group.groupKey)).toEqual(["driver:claudeAgent", "driver:codex"]);
+    expect(groups.map((group) => group.hasEnabled)).toEqual([true, false]);
+  });
+
+  it("sorts enabled, then default, then input order within a group", () => {
+    const [group] = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "disabled-default",
+        enabled: false,
+        isDefault: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 0,
+      }),
+      treeItem({
+        instanceId: "enabled-custom",
+        enabled: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 1,
+      }),
+      treeItem({
+        instanceId: "enabled-default",
+        enabled: true,
+        isDefault: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 2,
+      }),
+    ]);
+
+    expect(group).toBeDefined();
+    expect(group!.items.map((item) => item.instanceId)).toEqual([
+      ProviderInstanceId.make("enabled-default"),
+      ProviderInstanceId.make("enabled-custom"),
+      ProviderInstanceId.make("disabled-default"),
+    ]);
+    expect(group!.enabledCount).toBe(2);
+    expect(group!.totalCount).toBe(3);
+  });
+
+  it("groups multiple antigravity instances and keeps project-override ordering", () => {
+    const [group] = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "antigravity",
+        enabled: false,
+        isDefault: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 0,
+      }),
+      treeItem({
+        instanceId: "antigravity_work",
+        enabled: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 1,
+      }),
+    ]);
+
+    expect(group).toMatchObject({
+      groupKey: "driver:antigravity",
+      enabledCount: 1,
+      totalCount: 2,
+      hasEnabled: true,
+      firstOriginalIndex: 0,
+    });
+    expect(group!.items.map((item) => item.enabled)).toEqual([true, false]);
+  });
+
+  it("groups ACP instances by agent id and prefixes local ACP with the shared key", () => {
+    const groups = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "droid-a",
+        enabled: true,
+        groupKey: "acp:factory-droid",
+        groupLabel: "Factory Droid",
+        driver: acpDriver,
+        originalIndex: 0,
+        acpRegistryAgentId: "factory-droid",
+        acpRegistryIconUrl: "https://example.com/droid.svg",
+      }),
+      treeItem({
+        instanceId: "droid-b",
+        enabled: true,
+        groupKey: "acp:factory-droid",
+        groupLabel: "Factory Droid",
+        driver: acpDriver,
+        originalIndex: 1,
+      }),
+      treeItem({
+        instanceId: "local-a",
+        enabled: true,
+        groupKey: "acp:local",
+        groupLabel: "Local ACP",
+        driver: acpDriver,
+        originalIndex: 2,
+      }),
+      treeItem({
+        instanceId: "local-b",
+        enabled: false,
+        groupKey: "acp:local",
+        groupLabel: "Local ACP",
+        driver: acpDriver,
+        originalIndex: 3,
+      }),
+    ]);
+
+    expect(groups.map((group) => group.groupKey)).toEqual(["acp:factory-droid", "acp:local"]);
+    expect(groups[0]?.items).toHaveLength(2);
+    expect(groups[0]?.totalCount).toBe(2);
+    expect(groups[0]?.acpRegistryAgentId).toBe("factory-droid");
+    expect(groups[0]?.acpRegistryIconUrl).toBe("https://example.com/droid.svg");
+    expect(groups[1]?.enabledCount).toBe(1);
+    expect(groups[1]?.totalCount).toBe(2);
+  });
+
+  it("keeps single-instance providers as one-item groups", () => {
+    const groups = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "cursor",
+        enabled: true,
+        groupKey: "driver:cursor",
+        originalIndex: 0,
+      }),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.items).toHaveLength(1);
+  });
+
+  it("uses the first enabled version, then the first version, else null", () => {
+    const [enabledGroup] = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "disabled-first",
+        enabled: false,
+        groupKey: "driver:antigravity",
+        originalIndex: 0,
+        versionLabel: "v1",
+      }),
+      treeItem({
+        instanceId: "enabled-second",
+        enabled: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 1,
+        versionLabel: "v2",
+      }),
+    ]);
+    expect(enabledGroup?.sharedVersionLabel).toBe("v2");
+
+    const [disabledGroup] = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "disabled-first",
+        enabled: false,
+        groupKey: "driver:antigravity",
+        originalIndex: 0,
+      }),
+      treeItem({
+        instanceId: "disabled-second",
+        enabled: false,
+        groupKey: "driver:antigravity",
+        originalIndex: 1,
+        versionLabel: "v3",
+      }),
+    ]);
+    expect(disabledGroup?.sharedVersionLabel).toBe("v3");
+
+    const [emptyGroup] = buildProviderInstanceTree([
+      treeItem({
+        instanceId: "codex",
+        enabled: false,
+        groupKey: "driver:codex",
+        originalIndex: 0,
+        versionLabel: null,
+      }),
+    ]);
+    expect(emptyGroup?.sharedVersionLabel).toBeNull();
+  });
+
+  it("keeps the first-seen original index for a re-encountered group", () => {
+    const groups = buildProviderInstanceTree([
+      treeItem({ instanceId: "a-1", enabled: true, groupKey: "driver:a", originalIndex: 8 }),
+      treeItem({ instanceId: "b", enabled: true, groupKey: "driver:b", originalIndex: 2 }),
+      treeItem({ instanceId: "a-2", enabled: true, groupKey: "driver:a", originalIndex: 5 }),
+    ]);
+
+    expect(groups.map((group) => group.groupKey)).toEqual(["driver:b", "driver:a"]);
+    expect(groups[1]?.firstOriginalIndex).toBe(8);
+  });
+});
+
+describe("isProviderGroupExpanded", () => {
+  const group = (
+    overrides: { readonly hasEnabled?: boolean; readonly items?: Array<{ enabled: boolean }> } = {},
+  ) => ({
+    groupKey: "driver:antigravity",
+    hasEnabled: overrides.hasEnabled ?? true,
+    items: overrides.items?.map((item, index) =>
+      treeItem({
+        instanceId: `antigravity-${index}`,
+        enabled: item.enabled,
+        groupKey: "driver:antigravity",
+        originalIndex: index,
+      }),
+    ) ?? [
+      treeItem({
+        instanceId: "antigravity-0",
+        enabled: true,
+        groupKey: "driver:antigravity",
+        originalIndex: 0,
+      }),
+      treeItem({
+        instanceId: "antigravity-1",
+        enabled: false,
+        groupKey: "driver:antigravity",
+        originalIndex: 1,
+      }),
+    ],
+  });
+
+  it("never treats a single instance as collapsible", () => {
+    expect(
+      isProviderGroupExpanded({
+        group: { ...group(), items: group().items.slice(0, 1) },
+        overrides: {},
+      }),
+    ).toBe(false);
+  });
+
+  it("defaults to open for enabled groups and closed otherwise", () => {
+    expect(isProviderGroupExpanded({ group: group(), overrides: {} })).toBe(true);
+    expect(
+      isProviderGroupExpanded({
+        group: group({ hasEnabled: false, items: [{ enabled: false }, { enabled: false }] }),
+        overrides: {},
+      }),
+    ).toBe(false);
+  });
+
+  it("opens for the selected or targeted instance", () => {
+    const disabledGroup = group({
+      hasEnabled: false,
+      items: [{ enabled: false }, { enabled: false }],
+    });
+    expect(
+      isProviderGroupExpanded({
+        group: disabledGroup,
+        selectedInstanceId: ProviderInstanceId.make("antigravity-1"),
+        overrides: {},
+      }),
+    ).toBe(true);
+    expect(
+      isProviderGroupExpanded({
+        group: disabledGroup,
+        targetInstanceId: ProviderInstanceId.make("antigravity-0"),
+        overrides: {},
+      }),
+    ).toBe(true);
+  });
+
+  it("lets explicit overrides win", () => {
+    expect(
+      isProviderGroupExpanded({
+        group: group(),
+        overrides: { "driver:antigravity": false },
+      }),
+    ).toBe(false);
+    expect(
+      isProviderGroupExpanded({
+        group: group({ hasEnabled: false, items: [{ enabled: false }, { enabled: false }] }),
+        overrides: { "driver:antigravity": true },
+      }),
+    ).toBe(true);
   });
 });
