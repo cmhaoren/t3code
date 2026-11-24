@@ -662,6 +662,10 @@
     "./assistantInsights": {
       "types": "./src/assistantInsights.ts",
       "import": "./src/assistantInsights.ts"
+    },
+    "./zstdFrames": {
+      "types": "./src/zstdFrames.ts",
+      "import": "./src/zstdFrames.ts"
     }
   },
   "scripts": {

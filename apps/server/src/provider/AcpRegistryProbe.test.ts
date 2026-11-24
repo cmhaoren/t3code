@@ -526,6 +526,80 @@ await import(pathToFileURL(agentPath).href);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
+  it.live("isolates DeepSeek Harness Desktop history when acp follows the cli.js entrypoint", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "acp-probe-dsh-desktop-" });
+      const launcher = NodePath.join(directory, "dsh-fixture.mjs");
+      const launchLog = NodePath.join(directory, "launch.json");
+      yield* fs.writeFileString(
+        launcher,
+        `
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [,, agentPath, logPath, ...args] = process.argv;
+const patchFlag = args.lastIndexOf("--patch");
+const patchPath = patchFlag === -1 ? null : args[patchFlag + 1];
+const patch = patchPath === null ? null : JSON.parse(readFileSync(patchPath, "utf8"));
+writeFileSync(logPath, JSON.stringify({ args, patch }));
+await import(pathToFileURL(agentPath).href);
+`,
+      );
+      const userPatch = NodePath.join(directory, "user-patch.json");
+      yield* fs.writeFileString(userPatch, "[]");
+      // The unwrapped Desktop shim: `DeepSeek Harness.exe --expose-internals <cli.js> acp`.
+      const cliJs =
+        "C:\\install\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js";
+      const commandArgs = [
+        launcher,
+        mockAgentPath,
+        launchLog,
+        "--expose-internals",
+        cliJs,
+        "acp",
+        "--patch",
+        userPatch,
+      ];
+      const catalog = AcpRegistrySupport.AcpRegistryCatalog.of({
+        search: () => Effect.die("unused search"),
+        prepare: () => Effect.die("unused prepare"),
+        inspect: () => Effect.die("unused inspect"),
+        uninstallManagedBinary: () => Effect.die("unused uninstall"),
+        resolve: () =>
+          Effect.succeed({
+            distribution: "local",
+            spawn: {
+              command: process.execPath,
+              args: commandArgs,
+            },
+          }),
+      });
+      const result = yield* probeAcpRegistryConfiguration({
+        instanceId,
+        settings: decodeSettings({
+          source: "local",
+          commandPath: "DeepSeek Harness.exe",
+          commandArgs,
+        }),
+        cwd: directory,
+        environment: process.env,
+      }).pipe(Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog));
+      expect(result.probe.ready).toBe(true);
+
+      const { args, patch } = JSON.parse(yield* fs.readFileString(launchLog));
+      expect(args).toEqual([...commandArgs.slice(3), "--patch", expect.any(String)]);
+      const probeDirectory = NodePath.dirname(args.at(-1));
+      expect(patch).toEqual([
+        {
+          id: "session-persistence-jsonl",
+          config: { root: NodePath.join(probeDirectory, "sessions") },
+        },
+        { id: "session-projection-cache", disabled: true },
+      ]);
+      expect(yield* fs.exists(probeDirectory)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   it("distinguishes authentication failures from generic probe failures", () => {
     const advertised = normalizeAcpRegistryAuthMethods([
       { id: "grok-login", name: "Log in with Grok" },

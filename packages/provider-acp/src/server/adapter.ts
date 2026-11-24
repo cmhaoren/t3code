@@ -392,6 +392,16 @@ export interface AcpAdapterV2Flavor {
     readonly promptCapabilities: EffectAcpSchema.AgentCapabilities["promptCapabilities"];
   }) => Effect.Effect<ReadonlyArray<EffectAcpSchema.ContentBlock>, EffectAcpErrors.AcpError>;
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
+  /**
+   * A prompt failure the flavor can retry on another model route (DeepSeek Harness's
+   * apigoto keys). The turn switches the session's model option and resends the prompt.
+   */
+  readonly resolvePromptErrorFailoverModel?: (input: {
+    readonly error: unknown;
+    readonly currentModelId: string;
+    readonly availableModelIds: ReadonlyArray<string>;
+    readonly triedModelIds: ReadonlySet<string>;
+  }) => { readonly nextModelId: string; readonly reason: string } | undefined;
   /** The flavor's runtime refuses a version the policy rates broken when it starts. */
   readonly checksVersionAtHandshake?: boolean;
   /**
@@ -1752,6 +1762,8 @@ interface ActiveAcpTurn {
   promptSequence: number;
   /** The turn already resent a prompt after a resumable outcome failure. */
   outcomeResumed: boolean;
+  /** Models this turn already tried through a prompt-error failover. */
+  readonly triedFailoverModelIds: Set<string>;
   /** Clock millis just before `session/prompt` was handed to the runtime. */
   promptSentAt: number | null;
   /** Completed when an update after dispatch matches `cancelAfterPromptStarts.isStart`. */
@@ -9466,6 +9478,66 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       error.success._tag === "AcpRequestError" &&
                       error.success.code === -32800);
                   const failure = Cause.squash(cause);
+                  // DeepSeek Harness's apigoto routes fail over by switching the session's
+                  // model option after a failed prompt and resending it on the same session.
+                  if (
+                    !interrupted &&
+                    !context.finalized &&
+                    !superseded() &&
+                    settle.compactSession === undefined &&
+                    flavor.resolvePromptErrorFailoverModel !== undefined
+                  ) {
+                    const modelOption = findModelConfigOption(yield* runtime.getConfigOptions);
+                    if (modelOption?.type === "select") {
+                      const currentModelId =
+                        modelOption.currentValue ?? context.input.modelSelection.model;
+                      context.triedFailoverModelIds.add(currentModelId);
+                      const availableModelIds = flattenSelectChoices(modelOption.options).map(
+                        (choice) => choice.value,
+                      );
+                      const nextFailover = flavor.resolvePromptErrorFailoverModel({
+                        error: failure,
+                        currentModelId,
+                        availableModelIds,
+                        triedModelIds: context.triedFailoverModelIds,
+                      });
+                      if (
+                        nextFailover !== undefined &&
+                        !context.triedFailoverModelIds.has(nextFailover.nextModelId) &&
+                        context.triedFailoverModelIds.size < 4
+                      ) {
+                        context.triedFailoverModelIds.add(nextFailover.nextModelId);
+                        const switched = yield* runtime
+                          .setConfigOption(modelOption.id, nextFailover.nextModelId, {
+                            resendCurrentValue: true,
+                          })
+                          .pipe(Effect.result);
+                        if (
+                          Result.isSuccess(switched) &&
+                          !context.finalized &&
+                          !context.interrupted &&
+                          !superseded()
+                        ) {
+                          // The retry is a new prompt for the inactivity watchdog.
+                          context.promptSentAt = yield* Clock.currentTimeMillis;
+                          context.lastProgressAt = context.promptSentAt;
+                          yield* reportProviderRetry({
+                            sessionId: context.nativeThreadId,
+                            failure: makeProviderFailure({
+                              message: nextFailover.reason,
+                              class: "usage_limit",
+                              retryable: true,
+                              cause: failure,
+                            }),
+                          });
+                          yield* followPrompt(context, prompt, settle).pipe(
+                            Effect.forkIn(sessionScope),
+                          );
+                          return;
+                        }
+                      }
+                    }
+                  }
                   // A resumed prompt stands in for an outcome failure, which always restarts.
                   if (
                     !interrupted &&
@@ -9689,6 +9761,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               foregroundIdle: yield* Deferred.make<void>(),
               promptSequence: 0,
               outcomeResumed: false,
+              triedFailoverModelIds: new Set(),
               promptSentAt: null,
               promptStarted,
               promptUsage: undefined,

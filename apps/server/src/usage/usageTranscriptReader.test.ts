@@ -101,6 +101,37 @@ describe("compressed transcripts", () => {
     assert.isAbove(listed.files.find((file) => file.path === compressed)?.size ?? 0, 0);
   });
 
+  it("discovers and reads every frame of a multi-frame .jsonl.zstd transcript", async () => {
+    const nested = NodePath.join(dir, "project", "session-1");
+    await NodeFSP.mkdir(nested, { recursive: true });
+    const path = NodePath.join(nested, "session.v4.jsonl.zstd");
+    const frames = [claudeLine(1, 5), claudeLine(2, 7), claudeLine(3, 11)].map((line) =>
+      NodeZlib.zstdCompressSync(Buffer.from(line)),
+    );
+    await NodeFSP.writeFile(path, Buffer.concat(frames));
+
+    // A single Node zstd stream would stop after the first frame.
+    const listed = await listTranscriptFiles(dir, 0);
+    assert.deepStrictEqual(
+      listed.files.map((file) => file.path),
+      [path],
+    );
+    const named = await listTranscriptFiles(dir, 0, { fileName: "session.v4.jsonl.zstd" });
+    assert.deepStrictEqual(
+      named.files.map((file) => file.path),
+      [path],
+    );
+
+    const parsed = await readTranscriptRecords(path, TEST_FORMATS.claude);
+    assert.isNotNull(parsed);
+    assert.deepStrictEqual(
+      parsed.records.map((record) => record.totals.outputTokens),
+      [5, 7, 11],
+    );
+    assert.isFalse(parsed.resumed);
+    assert.strictEqual(parsed.position.resumeOffset, 0);
+  });
+
   it("lists files in directory order when more directories wait than it reads at once", async () => {
     for (let index = 0; index < 40; index += 1) {
       const nested = NodePath.join(dir, `project-${index}`, "sessions");

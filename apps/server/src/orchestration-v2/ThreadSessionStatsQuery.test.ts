@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeZlib from "node:zlib";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -325,6 +328,47 @@ describe("computeThreadSessionStats", () => {
     expect(result.tokensPerSecond).toBe(12.5);
   });
 
+  it("uses item intervals when a ledger reports no assistant active time", () => {
+    const result = computeThreadSessionStats(
+      input({
+        providerTurns: [
+          turn("turn-1", "pt1", {
+            turnTokenUsage: {
+              usageScope: "main_agent",
+              usageStatus: "unavailable",
+              hasSubagents: false,
+            },
+          }),
+        ],
+        turnItems: [
+          item("i1", "turn-1", "assistant_message", {
+            startedAt: utc("2026-01-01T00:00:00Z"),
+            completedAt: utc("2026-01-01T00:00:02Z"),
+          }),
+        ],
+        droidUsageFallbacks: [
+          {
+            providerThreadId: ProviderThreadId.make("pt1"),
+            usage: {
+              uncachedInputTokens: 100,
+              outputTokens: 50,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              thinkingTokens: 0,
+              assistantActiveTimeMs: 0,
+            },
+          },
+        ],
+      }),
+    );
+
+    // DSH ledgers without step timing report zero; the item stream still supplies it.
+    expect(result.llmDurationMs).toBe(2_000);
+    expect(result.decodeDurationMs).toBe(2_000);
+    expect(result.decodeOutputTokens).toBe(50);
+    expect(result.tokensPerSecond).toBe(25);
+  });
+
   it("keeps per-turn records when they already exceed the ledger total", () => {
     const result = computeThreadSessionStats(
       input({
@@ -570,6 +614,113 @@ describe("ThreadSessionStatsQuery", () => {
         cacheHitPercent: 75,
       });
       expect(result.tokensPerSecond).toBe(12.5);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("enriches a DeepSeek Harness thread from its multi-frame session ledger", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dshHome = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "thread-session-stats-dsh-",
+      });
+      const sessionId = "session-dsh-1";
+      const sessionDir = path.join(dshHome, "sessions", "_no-cwd", sessionId);
+      yield* fileSystem.makeDirectory(sessionDir, { recursive: true });
+      const frame = (lines: ReadonlyArray<unknown>) =>
+        NodeZlib.zstdCompressSync(
+          Buffer.from(lines.map((line) => `${JSON.stringify(line)}\n`).join("")),
+        );
+      yield* fileSystem.writeFile(
+        path.join(sessionDir, "session.v4.jsonl.zstd"),
+        Buffer.concat([
+          frame([
+            { type: "session", version: 4, id: sessionId, cwd: "D:\\dstest" },
+            { type: "step/start", seq: 0, time: 1_000, data: { turn: 1, step: 1 } },
+          ]),
+          frame([
+            {
+              type: "assistant/message",
+              seq: 1,
+              time: 2_000,
+              data: {
+                usage: {
+                  inputTokens: 100,
+                  outputTokens: 60,
+                  cacheReadTokens: 200,
+                  cacheWriteTokens: 50,
+                },
+              },
+            },
+          ]),
+          frame([{ type: "step/end", seq: 2, time: 3_000, data: { turn: 1, step: 1 } }]),
+        ]),
+      );
+
+      const result = yield* Effect.gen(function* () {
+        const query = yield* ThreadSessionStatsQuery;
+        return yield* query.getThreadSessionStats({ threadId: THREAD_ID });
+      }).pipe(
+        Effect.provide(
+          threadSessionStatsLayer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                NodeServices.layer,
+                Layer.mock(ThreadManagement.ThreadManagementService)({
+                  getThreadRecords: () =>
+                    Effect.succeed({
+                      thread: {
+                        id: THREAD_ID,
+                        activeProviderThreadId: ProviderThreadId.make("pt1"),
+                        worktreePath: null,
+                      },
+                      providerThreads: [
+                        providerThread("pt1", {
+                          nativeThreadRef: { nativeId: sessionId },
+                        }),
+                      ],
+                      providerTurns: [
+                        turn("turn-1", "pt1", {
+                          turnTokenUsage: {
+                            usageScope: "main_agent",
+                            usageStatus: "unavailable",
+                            hasSubagents: false,
+                          },
+                        }),
+                      ],
+                      turnItems: [],
+                    } as never),
+                }),
+                Layer.mock(ServerSettings.ServerSettingsService)({
+                  getSettings: Effect.succeed({
+                    providerInstances: {
+                      acpRegistry: {
+                        driver: "acpRegistry",
+                        enabled: true,
+                        config: { source: "local", commandPath: "dsh" },
+                        environment: [{ name: "DSH_HOME", value: dshHome }],
+                      },
+                    },
+                  } as never),
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(result.tokenUsage).toEqual({
+        uncachedInputTokens: 100,
+        cacheReadTokens: 200,
+        cacheWriteTokens: 50,
+        outputTokens: 60,
+        reasoningTokens: 0,
+        totalTokens: 410,
+        cacheHitPercent: 57,
+      });
+      expect(result.decodeOutputTokens).toBe(60);
+      expect(result.decodeDurationMs).toBe(2_000);
+      expect(result.tokensPerSecond).toBe(30);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

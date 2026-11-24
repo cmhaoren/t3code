@@ -77,6 +77,7 @@ import {
   isFactoryDroidInstance,
   readFactoryUsageLimits,
 } from "./factoryUsageLimits.ts";
+import { dshUsageReader } from "./dshUsage.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
 const decodeSettings = Schema.decodeSync(AcpRegistrySettings);
@@ -671,7 +672,11 @@ export type AcpRegistryDriverEnv =
   | HttpClient.HttpClient
   | ProviderHost.ProviderHost;
 
-export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryDriverEnv> = {
+export const AcpRegistryDriver: ProviderDriver<
+  AcpRegistrySettings,
+  AcpRegistryDriverEnv,
+  Path.Path
+> = {
   driverKind: DRIVER_KIND,
   metadata: {
     displayName: "ACP Registry",
@@ -680,6 +685,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
   },
   configSchema: AcpRegistrySettings,
   defaultConfig: () => decodeSettings({}),
+  usage: dshUsageReader,
   create: Effect.fn("AcpRegistryDriver.create")(function* ({
     instanceId,
     displayName,

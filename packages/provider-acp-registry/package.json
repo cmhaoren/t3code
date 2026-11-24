@@ -34,6 +34,18 @@
     "./server/factoryUsageLimits": {
       "types": "./src/server/factoryUsageLimits.ts",
       "import": "./src/server/factoryUsageLimits.ts"
+    },
+    "./server/deepseekIdentity": {
+      "types": "./src/server/deepseekIdentity.ts",
+      "import": "./src/server/deepseekIdentity.ts"
+    },
+    "./server/deepseekAcp": {
+      "types": "./src/server/deepseekAcp.ts",
+      "import": "./src/server/deepseekAcp.ts"
+    },
+    "./server/dshSessionUsage": {
+      "types": "./src/server/dshSessionUsage.ts",
+      "import": "./src/server/dshSessionUsage.ts"
     }
   },
   "scripts": {

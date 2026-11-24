@@ -150,6 +150,83 @@ describe("resolveProviderGroupIdentity", () => {
     ).toEqual({ groupKey: "acp:local", groupLabel: "Local ACP" });
   });
 
+  it("groups local DeepSeek Harness commands under their own brand group", () => {
+    const args = [
+      "--expose-internals",
+      "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js",
+      "--profile",
+      "acp",
+    ];
+    for (const commandPath of [
+      "dsh.cmd",
+      "C:\\Users\\me\\AppData\\Roaming\\npm\\dsh",
+      "C:\\Program Files\\DeepSeek Harness\\DeepSeek Harness.exe",
+    ]) {
+      expect(
+        resolveProviderGroupIdentity({
+          driver: acpDriver,
+          config: { source: "local", commandPath, commandArgs: args },
+          driverLabel: "ACP Registry",
+        }),
+      ).toEqual({
+        groupKey: "acp:deepseek-harness",
+        groupLabel: "DeepSeek Harness",
+        acpRegistryAgentId: "deepseek-harness",
+      });
+    }
+  });
+
+  it("detects a local DeepSeek Harness launch from its entrypoint args and keeps the icon", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: {
+          source: "local",
+          commandPath: "C:\\Program Files\\Custom\\node.exe",
+          commandArgs: ["/app/node_modules/@deepseek-ai/dsh/lib/cli.js", "--profile", "acp"],
+          registryIconUrl: "https://example.com/dsh.svg",
+        },
+        driverLabel: "ACP Registry",
+      }),
+    ).toEqual({
+      groupKey: "acp:deepseek-harness",
+      groupLabel: "DeepSeek Harness",
+      acpRegistryAgentId: "deepseek-harness",
+      acpRegistryIconUrl: "https://example.com/dsh.svg",
+    });
+  });
+
+  it("does not treat other local ACP commands as DeepSeek Harness", () => {
+    expect(
+      resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config: {
+          source: "local",
+          agentId: "custom-agent",
+          commandPath: "C:\\tools\\my-agent.cmd",
+          commandArgs: ["--expose-internals", "/app/node_modules/@example/agent/lib/cli.js"],
+        },
+        driverLabel: "ACP Registry",
+      }),
+    ).toEqual({ groupKey: "acp:local", groupLabel: "Local ACP" });
+  });
+
+  it("groups registry DeepSeek Harness agent ids under the brand group", () => {
+    for (const agentId of ["deepseek-harness", "dsh"]) {
+      expect(
+        resolveProviderGroupIdentity({
+          driver: acpDriver,
+          config: { agentId },
+          driverLabel: "ACP Registry",
+        }),
+      ).toEqual({
+        groupKey: "acp:deepseek-harness",
+        groupLabel: "DeepSeek Harness",
+        acpRegistryAgentId: agentId,
+      });
+    }
+  });
+
   it("names the factory-droid agent and carries its registry icon", () => {
     expect(
       resolveProviderGroupIdentity({
@@ -364,6 +441,47 @@ describe("buildProviderInstanceTree", () => {
     expect(groups[0]?.acpRegistryIconUrl).toBe("https://example.com/droid.svg");
     expect(groups[1]?.enabledCount).toBe(1);
     expect(groups[1]?.totalCount).toBe(2);
+  });
+
+  it("groups two DeepSeek Harness instances under one brand group", () => {
+    const configs = [
+      { source: "local", commandPath: "dsh.cmd", commandArgs: ["--profile", "acp"] },
+      { source: "local", commandPath: "C:\\Tools\\dsh", commandArgs: ["--profile", "acp"] },
+    ];
+    const items = configs.map((config, index) => {
+      const identity = resolveProviderGroupIdentity({
+        driver: acpDriver,
+        config,
+        driverLabel: "ACP Registry",
+        liveIconUrl: index === 0 ? "https://example.com/dsh.svg" : null,
+      });
+      return treeItem({
+        instanceId: `dsh-${String(index)}`,
+        enabled: true,
+        driver: acpDriver,
+        groupKey: identity.groupKey,
+        groupLabel: identity.groupLabel,
+        originalIndex: index,
+        ...(identity.acpRegistryAgentId !== undefined
+          ? { acpRegistryAgentId: identity.acpRegistryAgentId }
+          : {}),
+        ...(identity.acpRegistryIconUrl !== undefined
+          ? { acpRegistryIconUrl: identity.acpRegistryIconUrl }
+          : {}),
+      });
+    });
+
+    const groups = buildProviderInstanceTree(items);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      groupKey: "acp:deepseek-harness",
+      groupLabel: "DeepSeek Harness",
+      acpRegistryAgentId: "deepseek-harness",
+      acpRegistryIconUrl: "https://example.com/dsh.svg",
+      enabledCount: 2,
+      totalCount: 2,
+    });
   });
 
   it("keeps single-instance providers as one-item groups", () => {

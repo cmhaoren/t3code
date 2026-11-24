@@ -561,6 +561,81 @@ export const acpRegistryManagedBinaryDirectories = Effect.fn("acpRegistryManaged
   },
 );
 
+export interface WindowsBatchShimLaunch {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly env: NodeJS.ProcessEnv;
+  /** Files the launch depends on; the caller verifies they exist before launching. */
+  readonly requiredFiles: ReadonlyArray<string>;
+}
+
+export interface WindowsBatchShimParseInput {
+  readonly executablePath: string;
+  readonly content: string;
+  readonly userArgs: ReadonlyArray<string>;
+  readonly env: NodeJS.ProcessEnv;
+  readonly nodeExecutable?: string | undefined;
+  readonly dirname: (value: string) => string;
+  readonly join: (...parts: ReadonlyArray<string>) => string;
+}
+
+const normalizeBatchRelativePath = (value: string): string =>
+  value.replace(/[\\/]+/gu, "/").replace(/^\/+/u, "");
+
+function requiredHostPath(filePath: string): string {
+  // Entrypoints inside Electron `.asar` bundles exist on disk only up to the archive file itself.
+  const asarMatch = /^(.*?\.asar)(?:[\\/]|$)/iu.exec(filePath);
+  return asarMatch !== null ? asarMatch[1]! : filePath;
+}
+
+/**
+ * Unwrap transparent Windows `.cmd`/`.bat` shims (DeepSeek Harness Desktop `dsh.cmd`
+ * and standard npm `_prog` shims) into a direct executable + args without a shell.
+ */
+export function parseWindowsBatchShim(
+  input: WindowsBatchShimParseInput,
+): WindowsBatchShimLaunch | undefined {
+  if (!/\.(?:cmd|bat)$/iu.test(input.executablePath)) return undefined;
+  const content = input.content;
+  if (content.trim().length === 0) return undefined;
+  const directory = input.dirname(input.executablePath);
+  const resolveRelative = (relative: string) =>
+    input.join(directory, normalizeBatchRelativePath(relative));
+
+  // DeepSeek Harness Desktop: resources\runtime\cli\bin\dsh.cmd
+  const desktopExecutable = /"%~dp0([^"]*?DeepSeek Harness\.exe)"/iu.exec(content);
+  const desktopCli = /"%~dp0([^"]*?dsh-desktop-host[\\/]lib[\\/]cli\.js)"/iu.exec(content);
+  if (
+    /ELECTRON_RUN_AS_NODE\s*=\s*1/iu.test(content) &&
+    /--expose-internals/iu.test(content) &&
+    desktopExecutable !== null &&
+    desktopCli !== null
+  ) {
+    const executable = resolveRelative(desktopExecutable[1]!);
+    const cliPath = resolveRelative(desktopCli[1]!);
+    return {
+      command: executable,
+      args: ["--expose-internals", cliPath, ...input.userArgs],
+      env: { ...input.env, ELECTRON_RUN_AS_NODE: "1" },
+      requiredFiles: [executable, requiredHostPath(cliPath)],
+    };
+  }
+
+  // Standard npm shim: SET "_prog=..." and "%_prog%" "%dp0%\node_modules\...\cli.js" %*
+  if (!/_prog/iu.test(content)) return undefined;
+  const script =
+    /"%(?:~)?dp0%?[\\/]([^"]+?\.(?:js|mjs|cjs))"/iu.exec(content) ??
+    /"%(?:~)?dp0%?([^"]+?\.(?:js|mjs|cjs))"/iu.exec(content);
+  if (script === null || input.nodeExecutable === undefined) return undefined;
+  const scriptPath = resolveRelative(script[1]!);
+  return {
+    command: input.nodeExecutable,
+    args: [scriptPath, ...input.userArgs],
+    env: input.env,
+    requiredFiles: [scriptPath],
+  };
+}
+
 export interface ResolvedAcpRegistryDistribution {
   readonly kind: AcpRegistryDistributionKind;
   readonly args: ReadonlyArray<string>;
@@ -2535,6 +2610,34 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
     },
   );
 
+  const unwrapWindowsBatchShim = Effect.fn("unwrapWindowsBatchShim")(function* (input: {
+    readonly executablePath: string;
+    readonly userArgs: ReadonlyArray<string>;
+    readonly env: NodeJS.ProcessEnv;
+  }) {
+    if (platform !== "win32" || !/\.(?:cmd|bat)$/iu.test(input.executablePath)) {
+      return undefined;
+    }
+    const content = yield* fileSystem
+      .readFileString(input.executablePath)
+      .pipe(Effect.catchCause(() => Effect.succeed("")));
+    const launch = parseWindowsBatchShim({
+      executablePath: input.executablePath,
+      content,
+      userArgs: input.userArgs,
+      env: input.env,
+      nodeExecutable: resolveExecutable("node", platform, input.env),
+      dirname: (value) => path.dirname(value),
+      join: (...parts) => path.normalize(path.join(...parts)),
+    });
+    if (launch === undefined) return undefined;
+    for (const file of launch.requiredFiles) {
+      const exists = yield* fileSystem.exists(file).pipe(Effect.orElseSucceed(() => false));
+      if (!exists) return undefined;
+    }
+    return launch;
+  });
+
   const validateLocalExecutable = (command: string) =>
     platform === "win32" && /\.(?:cmd|bat)$/iu.test(command)
       ? Effect.fail(
@@ -2552,7 +2655,14 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
         const command = settings.commandPath.trim();
         if (!command) return { status: "unconfigured" } as const;
         const executable = resolveExecutable(command, platform, environment ?? hostEnvironment);
-        if (executable !== undefined) yield* validateLocalExecutable(executable);
+        if (executable !== undefined) {
+          const unwrapped = yield* unwrapWindowsBatchShim({
+            executablePath: executable,
+            userArgs: settings.commandArgs,
+            env: environment ?? hostEnvironment,
+          });
+          if (unwrapped === undefined) yield* validateLocalExecutable(executable);
+        }
         return executable === undefined
           ? ({
               status: "missing_runner",
@@ -2767,6 +2877,23 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
             reason: "runner_unavailable",
             detail: "Local ACP executable is not available on this environment's PATH.",
           });
+        }
+        const unwrapped = yield* unwrapWindowsBatchShim({
+          executablePath: command,
+          userArgs: settings.commandArgs,
+          env,
+        });
+        if (unwrapped !== undefined) {
+          return {
+            distribution: "local",
+            spawn: {
+              command: unwrapped.command,
+              args: unwrapped.args,
+              cwd,
+              env: unwrapped.env,
+              shell: false,
+            },
+          } satisfies ResolvedAcpRegistryAgent;
         }
         yield* validateLocalExecutable(command);
         return {

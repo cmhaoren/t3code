@@ -22,10 +22,12 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import { AcpRegistrySettings } from "@t3tools/provider-acp-registry/settings";
+import { isDeepSeekHarnessInstance } from "@t3tools/provider-acp-registry/server/deepseekIdentity";
 import {
   readDroidSessionUsage,
   type DroidSessionUsageSnapshot,
 } from "@t3tools/provider-acp-registry/server/droidSessionUsage";
+import { readDshSessionUsage } from "@t3tools/provider-acp-registry/server/dshSessionUsage";
 import { isFactoryDroidInstance } from "@t3tools/provider-acp-registry/server/factoryUsageLimits";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
@@ -63,7 +65,10 @@ const CHARS_PER_TOKEN = 4;
 const MAX_ITEM_CHARS = 100_000;
 const decodeAcpRegistrySettings = Schema.decodeUnknownOption(AcpRegistrySettings);
 
-/** Usage a Factory Droid session ledger reports for one provider thread. */
+/**
+ * Usage a provider session ledger reports for one provider thread. Factory
+ * Droid and DeepSeek Harness ledgers share the same cumulative counters.
+ */
 export interface ThreadSessionDroidUsageFallback {
   readonly providerThreadId: ProviderThreadId;
   readonly usage: DroidSessionUsageSnapshot;
@@ -666,14 +671,24 @@ const make = Effect.gen(function* () {
           ...rawConfig,
           enabled: instance.enabled ?? true,
         } as unknown);
-        if (Option.isNone(decodedSettings) || !isFactoryDroidInstance(decodedSettings.value)) {
-          continue;
-        }
-        const usage = yield* readDroidSessionUsage({
-          sessionId,
-          cwd: records.thread.worktreePath ?? undefined,
-          environment: mergeInstanceEnvironment(instance.environment),
-        }).pipe(
+        if (Option.isNone(decodedSettings)) continue;
+        const isDroid = isFactoryDroidInstance(decodedSettings.value);
+        const isDsh = !isDroid && isDeepSeekHarnessInstance(decodedSettings.value);
+        if (!isDroid && !isDsh) continue;
+        const environment = mergeInstanceEnvironment(instance.environment);
+        const usage = yield* (
+          isDroid
+            ? readDroidSessionUsage({
+                sessionId,
+                cwd: records.thread.worktreePath ?? undefined,
+                environment,
+              })
+            : readDshSessionUsage({
+                sessionId,
+                cwd: records.thread.worktreePath ?? undefined,
+                environment,
+              })
+        ).pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
         );

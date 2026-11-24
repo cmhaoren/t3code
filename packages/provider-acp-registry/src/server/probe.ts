@@ -29,6 +29,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 
 import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
+import { isDeepSeekHarnessCommand } from "./deepseekIdentity.ts";
 import {
   findModelConfigOption,
   parseSessionModeState,
@@ -394,16 +395,19 @@ export type AcpRegistryConfigurationProbe<Requirements = never> = (
 
 const isolateDeepSeekProbeHistory = Effect.fn("AcpRegistryProbe.isolateDeepSeekProbeHistory")(
   function* (commandPath: string, spawn: AcpSessionRuntime.AcpSpawnInput) {
-    const executable = (commandPath || spawn.command).split(/[\\/]/u).at(-1) ?? "";
-    if (!/^dsh(?:\.cmd|\.exe)?$/iu.test(executable)) return spawn;
+    // A local `dsh.cmd` unwraps to `DeepSeek Harness.exe --expose-internals .../cli.js`.
+    if (!isDeepSeekHarnessCommand(commandPath, spawn.command, spawn.args)) return spawn;
 
     const argumentSeparator = spawn.args.indexOf("--");
     const launcherArgs =
       argumentSeparator === -1 ? spawn.args : spawn.args.slice(0, argumentSeparator);
+    // The Desktop launcher puts `acp` after its `cli.js` entrypoint, not first.
+    const jsEntrypointIndex = launcherArgs.findIndex((argument) => /\.js$/iu.test(argument));
     const usesAcpProfile =
       launcherArgs[0] === "acp" ||
       launcherArgs.includes("--profile=acp") ||
-      launcherArgs.some((arg, index) => arg === "--profile" && launcherArgs[index + 1] === "acp");
+      launcherArgs.some((arg, index) => arg === "--profile" && launcherArgs[index + 1] === "acp") ||
+      (jsEntrypointIndex !== -1 && launcherArgs[jsEntrypointIndex + 1] === "acp");
     if (!usesAcpProfile) return spawn;
 
     // DeepSeek persists session/new before any prompt and does not advertise session/delete.

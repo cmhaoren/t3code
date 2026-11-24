@@ -6,13 +6,13 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeStringDecoder from "node:string_decoder";
 import * as NodeUtil from "node:util";
-import * as NodeZlib from "node:zlib";
 
 import type {
   SelectedFields,
   TranscriptUsageFormat,
   UsageRecord,
 } from "@t3tools/provider-core/server/usage";
+import { decompressZstdFrameChunks } from "@t3tools/shared/zstdFrames";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
@@ -64,6 +64,9 @@ function selectUsageFields(fields: SelectedFields) {
   };
 }
 
+const isCompressedZstd = (path: string): boolean =>
+  path.endsWith(".jsonl.zst") || path.endsWith(".jsonl.zstd");
+
 function fnv1a(buffer: Buffer): number {
   let hash = 0x811c9dc5;
   for (let index = 0; index < buffer.length; index += 1) {
@@ -110,7 +113,7 @@ export async function listTranscriptFiles(
         return (
           fileName !== undefined
             ? entry.name === fileName
-            : entry.name.endsWith(".jsonl") || entry.name.endsWith(".jsonl.zst")
+            : entry.name.endsWith(".jsonl") || isCompressedZstd(entry.name)
         )
           ? [child]
           : [];
@@ -308,11 +311,16 @@ async function* readChunks(
   compressed: boolean,
 ): AsyncGenerator<Buffer> {
   if (compressed) {
-    // Compressed snapshots cache a full parse; decoded byte offsets cannot
-    // resume the compressed input.
-    yield* handle
-      .createReadStream({ start, autoClose: true, highWaterMark: READ_CHUNK_BYTES })
-      .compose(NodeZlib.createZstdDecompress());
+    // Node's zstd stream stops after the first frame, while DSH appends one
+    // frame per write. Read the whole snapshot and decompress every frame.
+    const buffer = await handle.readFile();
+    let yielded = false;
+    for (const chunk of decompressZstdFrameChunks(buffer)) {
+      yielded = true;
+      yield chunk;
+    }
+    // A file that is not a zstd stream must not be cached as an empty parse.
+    if (!yielded && buffer.length > 0) throw new Error("No complete zstd frame found");
     return;
   }
   const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
@@ -338,7 +346,7 @@ export async function readTranscriptRecords<State>(
   options?: { readonly streamingThresholdBytes?: number },
 ): Promise<TranscriptParseResult | null> {
   const streamingThresholdBytes = options?.streamingThresholdBytes ?? STREAMING_THRESHOLD_BYTES;
-  const compressed = filePath.endsWith(".jsonl.zst");
+  const compressed = isCompressedZstd(filePath);
   let handle: NodeFSP.FileHandle;
   try {
     handle = await NodeFSP.open(filePath, "r");

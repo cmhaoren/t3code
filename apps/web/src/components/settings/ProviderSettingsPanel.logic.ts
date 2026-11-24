@@ -156,6 +156,31 @@ function titleCaseAgentId(agentId: string): string {
   return words.length > 0 ? words.join(" ") : agentId;
 }
 
+const DSH_BINARY_NAME = /^dsh(?:\.cmd|\.exe)?$/iu;
+const DSH_DESKTOP_EXE_NAME = /^deepseek harness(?:\.exe)?$/iu;
+const DSH_ENTRYPOINT_ARG = /(?:^|[\\/])@deepseek-ai[\\/]dsh(?:-desktop-host)?[\\/]/iu;
+const DSH_REGISTRY_AGENT_IDS: ReadonlySet<string> = new Set(["deepseek-harness", "dsh"]);
+
+function executableBasename(commandPath: string): string {
+  return commandPath.trim().split(/[\\/]/u).pop() ?? "";
+}
+
+/**
+ * Detect DeepSeek Harness commands: the `dsh` CLI / desktop executable, or an
+ * unwrapped Electron-as-Node launch whose entrypoint lives under `@deepseek-ai/dsh`.
+ */
+function isDeepSeekHarnessConfig(config: unknown): boolean {
+  const commandPath = configText(config, "commandPath");
+  if (commandPath !== null) {
+    const basename = executableBasename(commandPath);
+    if (DSH_BINARY_NAME.test(basename) || DSH_DESKTOP_EXE_NAME.test(basename)) return true;
+  }
+  if (config === null || typeof config !== "object") return false;
+  const commandArgs = (config as Record<string, unknown>)["commandArgs"];
+  if (!Array.isArray(commandArgs)) return false;
+  return commandArgs.some((arg) => typeof arg === "string" && DSH_ENTRYPOINT_ARG.test(arg));
+}
+
 export function resolveProviderGroupIdentity(input: {
   readonly driver: ProviderDriverKind;
   readonly config: unknown;
@@ -170,10 +195,23 @@ export function resolveProviderGroupIdentity(input: {
       (typeof input.liveIconUrl === "string" && input.liveIconUrl.trim().length > 0
         ? input.liveIconUrl.trim()
         : null);
+    const deepSeekHarnessGroup = (registryAgentId: string): ProviderGroupIdentity => ({
+      groupKey: "acp:deepseek-harness",
+      // oxlint-disable-next-line t3code/no-untranslated-copy -- provider brand name stays English, like the registry id it groups
+      groupLabel: "DeepSeek Harness",
+      acpRegistryAgentId: registryAgentId,
+      ...(iconUrl !== null ? { acpRegistryIconUrl: iconUrl } : {}),
+    });
     if (source === "local") {
+      if (isDeepSeekHarnessConfig(input.config)) {
+        return deepSeekHarnessGroup("deepseek-harness");
+      }
       return { groupKey: "acp:local", groupLabel: m(msg("Local ACP")) };
     }
     if (agentId !== null) {
+      if (DSH_REGISTRY_AGENT_IDS.has(agentId)) {
+        return deepSeekHarnessGroup(agentId);
+      }
       return {
         groupKey: `acp:${agentId}`,
         groupLabel:

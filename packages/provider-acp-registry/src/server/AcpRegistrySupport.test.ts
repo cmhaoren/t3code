@@ -337,6 +337,279 @@ describe("AcpRegistrySupport", () => {
     ),
   );
 
+  it("parses the DeepSeek Harness Desktop cmd shim into its Electron-as-Node launch", () => {
+    const join = (...parts: ReadonlyArray<string>) => {
+      const resolved: Array<string> = [];
+      for (const segment of parts.join("/").split("/")) {
+        if (segment === "" || segment === ".") continue;
+        if (segment === "..") {
+          resolved.pop();
+          continue;
+        }
+        resolved.push(segment);
+      }
+      return resolved.join("/");
+    };
+    const content = [
+      "@echo off",
+      "setlocal DisableDelayedExpansion",
+      'set "ELECTRON_RUN_AS_NODE=1"',
+      '"%~dp0..\\..\\..\\..\\DeepSeek Harness.exe" --expose-internals "%~dp0..\\..\\..\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js" %*',
+      "exit /b %errorlevel%",
+    ].join("\r\n");
+    expect(
+      AcpRegistrySupport.parseWindowsBatchShim({
+        executablePath: "C:/install/resources/runtime/cli/bin/dsh.cmd",
+        content,
+        userArgs: ["--profile", "acp", "$(injected)"],
+        env: { PATH: "C:\\bin" },
+        nodeExecutable: "C:\\node\\node.exe",
+        dirname: (value) => value.slice(0, value.lastIndexOf("/")),
+        join,
+      }),
+    ).toEqual({
+      command: "C:/install/DeepSeek Harness.exe",
+      args: [
+        "--expose-internals",
+        "C:/install/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js",
+        "--profile",
+        "acp",
+        "$(injected)",
+      ],
+      env: { PATH: "C:\\bin", ELECTRON_RUN_AS_NODE: "1" },
+      requiredFiles: ["C:/install/DeepSeek Harness.exe", "C:/install/resources/app.asar"],
+    });
+  });
+
+  it("parses a standard npm cmd shim into node and the script", () => {
+    const join = (...parts: ReadonlyArray<string>) => {
+      const resolved: Array<string> = [];
+      for (const segment of parts.join("/").split("/")) {
+        if (segment === "" || segment === ".") continue;
+        if (segment === "..") {
+          resolved.pop();
+          continue;
+        }
+        resolved.push(segment);
+      }
+      return resolved.join("/");
+    };
+    const content = [
+      "@ECHO off",
+      "GOTO start",
+      ":find_dp0",
+      "SET dp0=%~dp0",
+      "EXIT /b",
+      ":start",
+      "SETLOCAL",
+      "CALL :find_dp0",
+      'IF EXIST "%dp0%\\node.exe" (',
+      '  SET "_prog=%dp0%\\node.exe"',
+      ") ELSE (",
+      '  SET "_prog=node"',
+      "  SET PATHEXT=%PATHEXT:;.JS;=;%",
+      ")",
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\some-agent\\dist\\cli.js" %*',
+    ].join("\r\n");
+    expect(
+      AcpRegistrySupport.parseWindowsBatchShim({
+        executablePath: "C:\\tools\\some-agent.cmd",
+        content,
+        userArgs: ["acp"],
+        env: { PATH: "C:\\bin" },
+        nodeExecutable: "C:\\Program Files\\nodejs\\node.exe",
+        dirname: () => "C:/tools",
+        join,
+      }),
+    ).toEqual({
+      command: "C:\\Program Files\\nodejs\\node.exe",
+      args: ["C:/tools/node_modules/some-agent/dist/cli.js", "acp"],
+      env: { PATH: "C:\\bin" },
+      requiredFiles: ["C:/tools/node_modules/some-agent/dist/cli.js"],
+    });
+  });
+
+  it("leaves unsupported batch shims for validateLocalExecutable to refuse", () => {
+    const base = {
+      executablePath: "C:\\tools\\agent.cmd",
+      userArgs: [] as ReadonlyArray<string>,
+      env: {},
+      nodeExecutable: "C:\\node.exe",
+      dirname: () => "C:\\tools",
+      join: (...parts: ReadonlyArray<string>) => parts.join("\\"),
+    };
+    expect(
+      AcpRegistrySupport.parseWindowsBatchShim({
+        ...base,
+        content: '@echo off\r\n"C:\\tools\\agent-real.exe" %*',
+      }),
+    ).toBeUndefined();
+    expect(
+      AcpRegistrySupport.parseWindowsBatchShim({
+        ...base,
+        executablePath: "C:\\tools\\agent.exe",
+        content: 'SET "_prog=node"\r\n"%_prog%" "%dp0%\\cli.js" %*',
+      }),
+    ).toBeUndefined();
+    // The npm shim needs a resolved node executable.
+    expect(
+      AcpRegistrySupport.parseWindowsBatchShim({
+        ...base,
+        nodeExecutable: undefined,
+        content: 'SET "_prog=node"\r\n"%_prog%" "%dp0%\\cli.js" %*',
+      }),
+    ).toBeUndefined();
+  });
+
+  it.effect("unwraps DeepSeek Harness Desktop and npm cmd shims for a local provider", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const cacheDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-acp-shim-" });
+      const bin = path.join(cacheDir, "resources", "runtime", "cli", "bin");
+      const exe = path.join(cacheDir, "DeepSeek Harness.exe");
+      const asarFile = path.join(cacheDir, "resources", "app.asar");
+      const cli = path.join(
+        asarFile,
+        "dsh",
+        "node_modules",
+        "@deepseek-ai",
+        "dsh-desktop-host",
+        "lib",
+        "cli.js",
+      );
+      const shim = path.join(bin, "dsh.cmd");
+      yield* fileSystem.makeDirectory(bin, { recursive: true });
+      yield* fileSystem.makeDirectory(path.dirname(asarFile), { recursive: true });
+      yield* fileSystem.writeFileString(exe, "");
+      yield* fileSystem.writeFileString(asarFile, "packed-asar");
+      const separator = path.sep;
+      const relative = (...parts: ReadonlyArray<string>) => parts.join(separator);
+      yield* fileSystem.writeFileString(
+        shim,
+        [
+          "@echo off",
+          "setlocal DisableDelayedExpansion",
+          'set "ELECTRON_RUN_AS_NODE=1"',
+          `"%~dp0${relative("..", "..", "..", "..", "DeepSeek Harness.exe")}" --expose-internals "%~dp0${relative("..", "..", "..", "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh-desktop-host", "lib", "cli.js")}" %*`,
+          "exit /b %errorlevel%",
+        ].join("\r\n"),
+      );
+
+      const environment = { PATH: cacheDir, ELECTRON_RUN_AS_NODE: "0" };
+      const catalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+        cacheDir,
+        toolsDir: path.join(cacheDir, "tools"),
+        registryUrl,
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(SpawnExecutableResolution, () => shim),
+      );
+      const localSettings = decodeAcpRegistrySettings({
+        source: "local",
+        commandPath: "dsh",
+        commandArgs: ["--profile", "acp", "$(injected)"],
+      });
+      expect(yield* catalog.inspect(localSettings, environment)).toEqual({
+        status: "ready",
+        agentId: "dsh",
+        version: null,
+        distribution: "local",
+      });
+      expect(yield* catalog.resolve(localSettings, "/workspace", environment)).toEqual({
+        distribution: "local",
+        spawn: {
+          command: exe,
+          args: ["--expose-internals", cli, "--profile", "acp", "$(injected)"],
+          cwd: "/workspace",
+          env: { ...environment, ELECTRON_RUN_AS_NODE: "1" },
+          shell: false,
+        },
+      });
+
+      // Standard npm shim: node + the script path, still without a shell.
+      const npmShimDir = path.join(cacheDir, "npm-bin");
+      const npmShim = path.join(npmShimDir, "some-agent.cmd");
+      const script = path.join(npmShimDir, "node_modules", "some-agent", "dist", "cli.js");
+      yield* fileSystem.makeDirectory(path.dirname(script), { recursive: true });
+      yield* fileSystem.writeFileString(script, "");
+      yield* fileSystem.writeFileString(
+        npmShim,
+        [
+          "@ECHO off",
+          "GOTO start",
+          ":find_dp0",
+          "SET dp0=%~dp0",
+          "EXIT /b",
+          ":start",
+          "SETLOCAL",
+          "CALL :find_dp0",
+          'IF EXIST "%dp0%\\node.exe" (',
+          '  SET "_prog=%dp0%\\node.exe"',
+          ") ELSE (",
+          '  SET "_prog=node"',
+          ")",
+          `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%${relative("node_modules", "some-agent", "dist", "cli.js")}" %*`,
+        ].join("\r\n"),
+      );
+      const nodeExecutable = path.join(cacheDir, "node.exe");
+      yield* fileSystem.writeFileString(nodeExecutable, "");
+      const npmCatalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+        cacheDir,
+        toolsDir: path.join(cacheDir, "tools"),
+        registryUrl,
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(SpawnExecutableResolution, (command) =>
+          command === "node" ? nodeExecutable : npmShim,
+        ),
+      );
+      const npmSettings = decodeAcpRegistrySettings({
+        source: "local",
+        commandPath: "some-agent",
+        commandArgs: ["acp"],
+      });
+      expect(yield* npmCatalog.resolve(npmSettings, "/workspace", environment)).toEqual({
+        distribution: "local",
+        spawn: {
+          command: nodeExecutable,
+          args: [script, "acp"],
+          cwd: "/workspace",
+          env: environment,
+          shell: false,
+        },
+      });
+
+      // An unrecognized shim still fails with the existing batch-wrapper error.
+      const otherShim = path.join(cacheDir, "other.cmd");
+      yield* fileSystem.writeFileString(otherShim, "@echo off\r\necho nope\r\n");
+      const otherCatalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+        cacheDir,
+        toolsDir: path.join(cacheDir, "tools"),
+        registryUrl,
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(SpawnExecutableResolution, () => otherShim),
+      );
+      const otherSettings = decodeAcpRegistrySettings({
+        source: "local",
+        commandPath: "other",
+      });
+      for (const failure of [
+        yield* otherCatalog.inspect(otherSettings).pipe(Effect.flip),
+        yield* otherCatalog.resolve(otherSettings, "/workspace").pipe(Effect.flip),
+      ]) {
+        expect(failure).toMatchObject({
+          reason: "runner_unavailable",
+          detail: expect.stringContaining("node.exe"),
+        });
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerResolver(() => Effect.die("unexpected registry request"))),
+    ),
+  );
+
   it.effect("resolves the local Command Code configurations the HTTP selector matches", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -384,6 +657,25 @@ describe("AcpRegistrySupport", () => {
       Effect.provide(layerResolver(() => Effect.die("unexpected registry request"))),
     ),
   );
+
+  it("uses HTTP MCP for DeepSeek Harness local and registry configurations", () => {
+    const localCommand = (commandPath: string, commandArgs: string[] = []) =>
+      decodeAcpRegistrySettings({ source: "local", commandPath, commandArgs });
+    expect(prefersHttpMcpTransport(localCommand("C:\\DeepSeek Harness\\dsh.cmd"))).toBe(true);
+    expect(prefersHttpMcpTransport(localCommand("C:\\DeepSeek Harness\\dsh.exe"))).toBe(true);
+    expect(
+      prefersHttpMcpTransport(
+        localCommand("C:\\install\\DeepSeek Harness.exe", [
+          "--expose-internals",
+          "C:\\install\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js",
+          "acp",
+        ]),
+      ),
+    ).toBe(true);
+    expect(
+      prefersHttpMcpTransport(decodeAcpRegistrySettings({ source: "registry", agentId: "dsh" })),
+    ).toBe(true);
+  });
 
   it.effect("reports missing or non-executable local commands without registry fallback", () =>
     Effect.gen(function* () {

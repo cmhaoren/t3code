@@ -14,6 +14,7 @@ import {
   diffDroidSessionUsageToTurnTokenUsage,
   readDroidSessionUsage,
 } from "./droidSessionUsage.ts";
+import { diffDshSessionUsageToTurnTokenUsage, readDshSessionUsage } from "./dshSessionUsage.ts";
 import { makeKimiPromptOutcomeWatch } from "./kimiAcp.ts";
 import { extractOmpElicitationForm } from "./ompAcp.ts";
 import { extractOpenCodeElicitationForm } from "./opencodeAcp.ts";
@@ -24,6 +25,8 @@ import {
   makeCopilotSubagentRouting,
 } from "./copilotAcp.ts";
 import { prefersHttpMcpTransport } from "./mcpTransport.ts";
+import { isDeepSeekHarnessInstance } from "./deepseekIdentity.ts";
+import { createDeepSeekApigotoFailover, deepseekPromptFailure } from "./deepseekAcp.ts";
 import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
 import { readCustomModelEntries } from "@t3tools/shared/model";
 import { AcpRegistrySettings } from "../settings.ts";
@@ -52,6 +55,8 @@ import {
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import { findModelConfigOption } from "@t3tools/provider-acp/server/runtimeModel";
+import { flattenSelectChoices } from "@t3tools/provider-acp/server/sessionConfig";
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
@@ -140,6 +145,44 @@ export function acpRegistryPromptFailure(agentId: string, cause: unknown) {
   });
 }
 
+/**
+ * DeepSeek Harness exposes its model routes as ACP model-option values. Two apigoto keys
+ * can serve the same model, so a failed key switches the session to its sibling and retries.
+ */
+function makeDeepSeekFlavor(): Pick<
+  AcpAdapterV2Flavor,
+  "alwaysSetModel" | "promptFailure" | "resolvePromptErrorFailoverModel" | "applyModelSelection"
+> {
+  const failover = createDeepSeekApigotoFailover();
+  return {
+    alwaysSetModel: true,
+    promptFailure: deepseekPromptFailure,
+    resolvePromptErrorFailoverModel: failover.resolvePromptErrorFailoverModel,
+    applyModelSelection: Effect.fn("applyModelSelection")(function* ({
+      runtime,
+      modelSelection,
+    }: Parameters<NonNullable<AcpAdapterV2Flavor["applyModelSelection"]>>[0]) {
+      const modelOption = findModelConfigOption(yield* runtime.getConfigOptions);
+      if (modelOption?.type !== "select") return undefined;
+      const availableModelIds = flattenSelectChoices(modelOption.options).map(
+        (choice) => choice.value,
+      );
+      const requested = modelSelection.model.trim();
+      const current = modelOption.currentValue;
+      const wantsDefault =
+        requested.length === 0 || requested === "default" || requested === "auto";
+      const target = wantsDefault
+        ? current
+        : failover.resolvePreferredModelId(requested, availableModelIds);
+      const resolved =
+        target !== undefined && availableModelIds.includes(target) ? target : current;
+      if (resolved === undefined) return undefined;
+      yield* runtime.setConfigOption(modelOption.id, resolved, { resendCurrentValue: true });
+      return resolved;
+    }),
+  };
+}
+
 function makeAcpRegistryRuntime(
   options: AcpRegistryAdapterV2Options,
   catalog: AcpRegistrySupport.AcpRegistryCatalog["Service"],
@@ -200,6 +243,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     yield* Effect.serviceOption(AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator),
   );
   const registryAgentId = options.settings.source === "local" ? "" : options.settings.agentId;
+  const isDsh = isDeepSeekHarnessInstance(options.settings);
   const startupKey =
     options.settings.source === "local" ? `local:${options.instanceId}` : registryAgentId;
   const isDevin = registryAgentId === "devin";
@@ -282,6 +326,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     ...(isAntigravityCli ? { wakeOnDetachedRequest: true, replyEndsWithUsageUpdate: true } : {}),
     promptFailure: (cause) =>
       acpRegistryPromptFailure(isVibe ? "mistral-vibe" : registryAgentId, cause),
+    ...(isDsh ? makeDeepSeekFlavor() : {}),
     ...(isDroid
       ? { extractElicitationForm: extractDroidElicitationForm }
       : isOmp
@@ -305,34 +350,39 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
                 ),
             ),
         }),
-    // Droid's prompt response carries no usage; its session settings file does.
-    ...(isDroid
+    // Droid and DeepSeek Harness prompt responses carry no token totals; their session ledgers do.
+    ...(isDroid || isDsh
       ? {
-          watchTurnTokenUsage: (input: { readonly sessionId: string; readonly cwd: string }) =>
-            readDroidSessionUsage({
-              sessionId: input.sessionId,
-              cwd: input.cwd,
-              environment: options.environment,
-            }).pipe(
+          watchTurnTokenUsage: (input: { readonly sessionId: string; readonly cwd: string }) => {
+            const readSnapshot = isDroid
+              ? readDroidSessionUsage({
+                  sessionId: input.sessionId,
+                  cwd: input.cwd,
+                  environment: options.environment,
+                })
+              : readDshSessionUsage({
+                  sessionId: input.sessionId,
+                  cwd: input.cwd,
+                  environment: options.environment,
+                });
+            const diffSnapshot = isDroid
+              ? diffDroidSessionUsageToTurnTokenUsage
+              : diffDshSessionUsageToTurnTokenUsage;
+            return readSnapshot.pipe(
               Effect.provideService(FileSystem.FileSystem, fileSystem),
               Effect.provideService(Path.Path, path),
               Effect.catchCause(() => Effect.succeed(null)),
               Effect.map(
                 (before) => (settle) =>
-                  readDroidSessionUsage({
-                    sessionId: input.sessionId,
-                    cwd: input.cwd,
-                    environment: options.environment,
-                  }).pipe(
+                  readSnapshot.pipe(
                     Effect.provideService(FileSystem.FileSystem, fileSystem),
                     Effect.provideService(Path.Path, path),
                     Effect.catchCause(() => Effect.succeed(null)),
-                    Effect.map((after) =>
-                      diffDroidSessionUsageToTurnTokenUsage(before, after, settle),
-                    ),
+                    Effect.map((after) => diffSnapshot(before, after, settle)),
                   ),
               ),
-            ),
+            );
+          },
         }
       : {}),
     ...(isVibe ? { registerExtensions: registerMistralVibeAcpExtensions } : {}),
