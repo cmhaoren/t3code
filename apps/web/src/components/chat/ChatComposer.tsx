@@ -484,6 +484,7 @@ export interface ChatComposerProps {
   onAdvanceActivePendingUserInput: () => void;
   onDismissActivePendingUserInput: (requestId: RuntimeRequestId) => void;
   onPreviousActivePendingUserInputQuestion: () => void;
+  onSelectActivePendingUserInputQuestionIndex?: (questionIndex: number) => void;
   onChangeActivePendingUserInputCustomAnswer: (
     questionId: string,
     value: string,
@@ -587,6 +588,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onAdvanceActivePendingUserInput,
     onDismissActivePendingUserInput,
     onPreviousActivePendingUserInputQuestion,
+    onSelectActivePendingUserInputQuestionIndex,
     onChangeActivePendingUserInputCustomAnswer,
     onProviderModelSelect,
     onOpenProviderSetup,
@@ -1272,6 +1274,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const pendingPrimaryAction = activePendingProgress
     ? {
         questionIndex: activePendingProgress.questionIndex,
+        questionCount: activePendingUserInput?.questions.length ?? 0,
         isLastQuestion: activePendingProgress.isLastQuestion,
         canAdvance:
           activePendingProgress.canAdvance &&
@@ -1279,8 +1282,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           !(questionPreparations[attachmentTargetKey] ?? 0),
         isResponding: activePendingIsResponding,
         isComplete: Boolean(activePendingResolvedAnswers),
+        answeredQuestionCount: activePendingProgress.answeredQuestionCount,
+        firstUnansweredQuestionIndex: activePendingProgress.firstUnansweredQuestionIndex,
       }
     : null;
+  const onNextPendingQuestion = useStableCallback(() => {
+    if (!activePendingProgress || activePendingProgress.isLastQuestion) return;
+    onSelectActivePendingUserInputQuestionIndex?.(activePendingProgress.questionIndex + 1);
+  });
   const hasMessageToSend = composerSendState.hasSendableContent || messageHasPreparingImages;
   const showResumeAction =
     canResume &&
@@ -3633,6 +3642,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onToggleOption={onSelectActivePendingUserInputOption}
                     onAdvance={onAdvanceActivePendingUserInput}
                     onDismiss={onDismissActivePendingUserInput}
+                    onSelectQuestionIndex={onSelectActivePendingUserInputQuestionIndex}
                   />
                 ) : null}
               </ComposerBanner.Root>
@@ -3934,6 +3944,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       hasSendableContent={false}
                       preserveComposerFocusOnPointerDown
                       onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
+                      onNextPendingQuestion={onNextPendingQuestion}
+                      onSelectPendingQuestionIndex={onSelectActivePendingUserInputQuestionIndex}
                       onInterrupt={handleInterruptPrimaryActionStable}
                     />
                   </div>
@@ -4030,6 +4042,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onSubmitMessage={handleSubmitMessageStable}
                     onResume={onResume}
                     onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
+                    onNextPendingQuestion={onNextPendingQuestion}
+                    onSelectPendingQuestionIndex={onSelectActivePendingUserInputQuestionIndex}
                     onInterrupt={handleInterruptPrimaryActionStable}
                     compactBeforeSendTokens={props.resumeCompactionTokens}
                     hideCompactToggle={dictationTakesFooter}

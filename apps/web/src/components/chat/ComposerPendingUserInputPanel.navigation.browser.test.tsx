@@ -246,6 +246,50 @@ it("stays on an unanswered question when the composer submits", async () => {
   await expect.element(screen.getByRole("status")).toHaveTextContent("Question 2");
 });
 
+function UnansweredJumpProbe(props: ProbeProps) {
+  const state = useProbeRequests(props);
+  useLayoutEffect(() => {
+    requests = state;
+  });
+  return (
+    <>
+      <output>Question {state.activePendingQuestionIndex + 1}</output>
+      <button type="button" onClick={() => state.onSelectActivePendingUserInputQuestionIndex(2)}>
+        Go to question 3
+      </button>
+      <button
+        type="button"
+        onClick={() => state.onSelectActivePendingUserInputOption("question-2", "Incremental")}
+      >
+        Choose for question 3
+      </button>
+      <button type="button" onClick={() => state.onAdvanceActivePendingUserInput()}>
+        Submit
+      </button>
+    </>
+  );
+}
+
+it("jumps to the first unanswered question when the last question is answered first", async () => {
+  await using screen = await render(
+    <UnansweredJumpProbe
+      environmentId={EnvironmentId.make("jump-environment")}
+      projection={questionProjection(threadRef.threadId)}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Go to question 3" }));
+  await expect.element(screen.getByRole("status")).toHaveTextContent("Question 3");
+
+  await userEvent.click(screen.getByRole("button", { name: "Choose for question 3" }));
+  await userEvent.click(screen.getByRole("button", { name: "Submit" }));
+
+  await expect.element(screen.getByRole("status")).toHaveTextContent("Question 1");
+  expect(requests.activePendingQuestionIndex).toBe(0);
+  expect(requests.activePendingDraftAnswers).toMatchObject({
+    "question-2": { selectedOptionValues: ["Incremental"] },
+  });
+});
+
 it("isolates drafts by environment, thread and request and discards only resolved requests", async () => {
   using _timers = fakeTimers();
   const environmentId = EnvironmentId.make("scope-environment");

@@ -194,3 +194,104 @@ it("swaps the collapsed composer's send button for Stop while a turn can be stop
   await screen.rerender(collapsed({ canInterrupt: false }));
   await expect.element(screen.getByRole("button", { name: "Send message" })).toBeVisible();
 });
+
+it("browses to the next question from the primary action while the current one is unanswered", async () => {
+  const props = setup();
+  const onNextPendingQuestion = vi.fn();
+  const submit = vi.fn();
+  await using screen = await render(
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <ComposerPrimaryActions
+        {...props}
+        pendingAction={{
+          questionIndex: 0,
+          questionCount: 2,
+          isLastQuestion: false,
+          canAdvance: false,
+          isResponding: false,
+          isComplete: false,
+          answeredQuestionCount: 0,
+          firstUnansweredQuestionIndex: 0,
+        }}
+        onNextPendingQuestion={onNextPendingQuestion}
+      />
+    </form>,
+  );
+  const next = screen.getByRole("button", { name: "Next", exact: true });
+  await expect.element(next).toBeEnabled();
+  await act(() => (next.element() as HTMLButtonElement).click());
+  expect(onNextPendingQuestion).toHaveBeenCalledTimes(1);
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("points the last question's primary action at the first unanswered question", async () => {
+  const props = setup();
+  const onSelectPendingQuestionIndex = vi.fn();
+  const submit = vi.fn();
+  const pendingAction = {
+    questionIndex: 2,
+    questionCount: 3,
+    isLastQuestion: true,
+    canAdvance: true,
+    isResponding: false,
+    isComplete: false,
+    answeredQuestionCount: 2,
+    firstUnansweredQuestionIndex: 0,
+  };
+  const view = (compact: boolean) => (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <ComposerPrimaryActions
+        {...props}
+        compact={compact}
+        pendingAction={pendingAction}
+        onSelectPendingQuestionIndex={onSelectPendingQuestionIndex}
+      />
+    </form>
+  );
+  await using screen = await render(view(false));
+  const fullLabel = screen.getByRole("button", { name: "Go to question 1", exact: true });
+  await expect.element(fullLabel).toBeEnabled();
+  await act(() => (fullLabel.element() as HTMLButtonElement).click());
+  expect(onSelectPendingQuestionIndex).toHaveBeenCalledWith(0);
+  expect(submit).not.toHaveBeenCalled();
+  await screen.rerender(view(true));
+  const compactLabel = screen.getByRole("button", { name: "Q1", exact: true });
+  await expect.element(compactLabel).toBeEnabled();
+  await act(() => (compactLabel.element() as HTMLButtonElement).click());
+  expect(onSelectPendingQuestionIndex).toHaveBeenCalledTimes(2);
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("keeps the last question's submit disabled when only that question is unanswered", async () => {
+  const props = setup();
+  await using screen = await render(
+    <ComposerPrimaryActions
+      {...props}
+      compact={false}
+      pendingAction={{
+        questionIndex: 2,
+        questionCount: 3,
+        isLastQuestion: true,
+        canAdvance: false,
+        isResponding: false,
+        isComplete: false,
+        answeredQuestionCount: 2,
+        firstUnansweredQuestionIndex: 2,
+      }}
+      onSelectPendingQuestionIndex={vi.fn()}
+    />,
+  );
+  await expect
+    .element(screen.getByRole("button", { name: "Submit answers", exact: true }))
+    .toBeDisabled();
+});

@@ -198,10 +198,13 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
   isPreparingWorktree: boolean;
   pendingAction: {
     questionIndex: number;
+    questionCount?: number;
     isLastQuestion: boolean;
     canAdvance: boolean;
     isResponding: boolean;
     isComplete: boolean;
+    answeredQuestionCount?: number;
+    firstUnansweredQuestionIndex?: number | null;
   } | null;
   isRunning: boolean;
   canInterrupt: boolean;
@@ -221,6 +224,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
   onSubmitMessage: React.MouseEventHandler<HTMLButtonElement>;
   onResume: () => void;
   onPreviousPendingQuestion: () => void;
+  onNextPendingQuestion?: (() => void) | undefined;
+  onSelectPendingQuestionIndex?: ((questionIndex: number) => void) | undefined;
   onInterrupt: () => void;
   compactBeforeSendTokens: number | null;
   hideCompactToggle: boolean;
@@ -252,6 +257,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
         onSubmitMessage={props.onSubmitMessage}
         onResume={props.onResume}
         onPreviousPendingQuestion={props.onPreviousPendingQuestion}
+        onNextPendingQuestion={props.onNextPendingQuestion}
+        onSelectPendingQuestionIndex={props.onSelectPendingQuestionIndex}
         onInterrupt={props.onInterrupt}
         compactBeforeSendTokens={props.compactBeforeSendTokens}
         hideCompactToggle={props.hideCompactToggle}

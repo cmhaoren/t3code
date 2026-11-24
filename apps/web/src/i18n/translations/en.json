@@ -12524,5 +12524,16 @@
   "370aa80e162adbf6": "Active",
   "6cf1569460ac1b85": "Switch",
   "4a879b1455b8beb8": "Delete version {version} of {name}",
-  "13997b2a4d91d5f1": "Factory Droid"
+  "13997b2a4d91d5f1": "Factory Droid",
+  "258afbc0f4325b1f": "{answered}/{total} answered",
+  "8eb12294c15025bc": "View one question at a time",
+  "7b7265a89df7d3c7": "View all questions together",
+  "2c75d2a7e8365837": "Single",
+  "045741aa62df51f8": "All",
+  "d115b4f051d2c1c3": "Restore question panel height",
+  "d4f01ddf64f3277c": "Expand question panel height",
+  "dd3f019dd4a099fb": "Questions",
+  "400fb20a5b7e7e83": "Custom answer",
+  "1ad2ff9da5552c0e": "Q{number}",
+  "42b390b499323580": "Go to question {number}"
 }

@@ -162,6 +162,71 @@ describe("pending user input question progress", () => {
       canAdvance: true,
     });
   });
+
+  it("reports no answered questions and the first question as unanswered", () => {
+    expect(derivePendingUserInputProgress(questions, {}, 0)).toMatchObject({
+      answeredQuestionIds: [],
+      answeredQuestionCount: 0,
+      firstUnansweredQuestionIndex: 0,
+    });
+  });
+
+  it("lists the answered question and still points at the skipped first question", () => {
+    expect(
+      derivePendingUserInputProgress(
+        questions,
+        {
+          compat: {
+            selectedOptionValues: ["Keep current envelope"],
+          },
+        },
+        0,
+      ),
+    ).toMatchObject({
+      answeredQuestionIds: ["compat"],
+      answeredQuestionCount: 1,
+      firstUnansweredQuestionIndex: 0,
+    });
+  });
+
+  it("points at the first unanswered question after an earlier answer", () => {
+    expect(
+      derivePendingUserInputProgress(
+        questions,
+        {
+          scope: {
+            selectedOptionValues: ["Orchestration-first"],
+          },
+        },
+        0,
+      ),
+    ).toMatchObject({
+      answeredQuestionIds: ["scope"],
+      answeredQuestionCount: 1,
+      firstUnansweredQuestionIndex: 1,
+    });
+  });
+
+  it("reports every question answered and no unanswered index", () => {
+    expect(
+      derivePendingUserInputProgress(
+        questions,
+        {
+          scope: {
+            selectedOptionValues: ["Orchestration-first"],
+          },
+          compat: {
+            selectedOptionValues: ["Keep current envelope"],
+          },
+        },
+        1,
+      ),
+    ).toMatchObject({
+      answeredQuestionIds: ["scope", "compat"],
+      answeredQuestionCount: 2,
+      firstUnansweredQuestionIndex: null,
+    });
+  });
 });
 
 describe("carryDisplacedCustomAnswerIntoPrompt", () => {

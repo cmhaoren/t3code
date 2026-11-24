@@ -31,10 +31,13 @@ import {
 
 interface PendingActionState {
   questionIndex: number;
+  questionCount?: number;
   isLastQuestion: boolean;
   canAdvance: boolean;
   isResponding: boolean;
   isComplete: boolean;
+  answeredQuestionCount?: number;
+  firstUnansweredQuestionIndex?: number | null;
 }
 
 interface ComposerPrimaryActionsProps {
@@ -64,6 +67,8 @@ interface ComposerPrimaryActionsProps {
   onSubmitMessage?: MouseEventHandler<HTMLButtonElement>;
   onResume?: () => void;
   onPreviousPendingQuestion: () => void;
+  onNextPendingQuestion?: (() => void) | undefined;
+  onSelectPendingQuestionIndex?: ((questionIndex: number) => void) | undefined;
   onInterrupt: () => void;
   compactBeforeSendTokens?: number | null;
   hideCompactToggle?: boolean;
@@ -77,11 +82,19 @@ const formatPendingPrimaryActionLabel = (
     isLastQuestion: boolean;
     isResponding: boolean;
     questionIndex: number;
+    firstUnansweredQuestionIndex?: number | null;
+    canJumpToUnanswered?: boolean;
   },
   resolve: MessageResolver,
 ) => {
   if (input.isResponding) {
     return resolve(msg("Submitting..."));
+  }
+  if (input.canJumpToUnanswered && input.firstUnansweredQuestionIndex != null) {
+    const number = input.firstUnansweredQuestionIndex + 1;
+    return input.compact
+      ? resolve(msg("Q{number}", { number }))
+      : resolve(msg("Go to question {number}", { number }));
   }
   if (input.compact) {
     return input.isLastQuestion
@@ -257,6 +270,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   onSubmitMessage,
   onResume,
   onPreviousPendingQuestion,
+  onNextPendingQuestion,
+  onSelectPendingQuestionIndex,
   onInterrupt,
   compactBeforeSendTokens = null,
   hideCompactToggle = false,
@@ -306,6 +321,19 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   );
 
   if (pendingAction) {
+    const firstUnansweredQuestionIndex = pendingAction.firstUnansweredQuestionIndex ?? null;
+    const canJumpToUnanswered =
+      pendingAction.isLastQuestion &&
+      !pendingAction.isComplete &&
+      !voiceInputActive &&
+      firstUnansweredQuestionIndex !== null &&
+      firstUnansweredQuestionIndex !== pendingAction.questionIndex &&
+      onSelectPendingQuestionIndex !== undefined;
+    const canBrowseNextUnanswered =
+      !pendingAction.isLastQuestion &&
+      !pendingAction.canAdvance &&
+      !voiceInputActive &&
+      onNextPendingQuestion !== undefined;
     return (
       <div className={cn("flex items-center justify-end", compact ? "gap-1.5" : "gap-2")}>
         {pendingAction.questionIndex > 0 ? (
@@ -338,7 +366,19 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           className={cn(messageActionPillClassName, "h-8 sm:h-7", compact ? "px-3" : "px-4")}
           {...pointerFocusProps}
           onClick={(event) => {
-            if (stopPhase === "landed") event.preventDefault();
+            if (stopPhase === "landed") {
+              event.preventDefault();
+              return;
+            }
+            if (canJumpToUnanswered && firstUnansweredQuestionIndex !== null) {
+              event.preventDefault();
+              onSelectPendingQuestionIndex(firstUnansweredQuestionIndex);
+              return;
+            }
+            if (canBrowseNextUnanswered) {
+              event.preventDefault();
+              onNextPendingQuestion();
+            }
           }}
           disabled={
             !canOperateThread ||
@@ -347,8 +387,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
             pendingAction.isResponding ||
             (!voiceInputActive &&
               (pendingAction.isLastQuestion
-                ? !pendingAction.isComplete
-                : !pendingAction.canAdvance))
+                ? !pendingAction.isComplete && !canJumpToUnanswered
+                : !pendingAction.canAdvance && !canBrowseNextUnanswered))
           }
         >
           {formatPendingPrimaryActionLabel(
@@ -357,6 +397,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
               isLastQuestion: pendingAction.isLastQuestion,
               isResponding: pendingAction.isResponding,
               questionIndex: pendingAction.questionIndex,
+              firstUnansweredQuestionIndex,
+              canJumpToUnanswered,
             },
             m,
           )}

@@ -83,6 +83,8 @@ export interface PendingUserInputProgress<Q extends UserInputQuestion = UserInpu
   resolvedAnswer: PendingUserInputAnswer | null;
   usingCustomAnswer: boolean;
   answeredQuestionCount: number;
+  answeredQuestionIds: ReadonlyArray<string>;
+  firstUnansweredQuestionIndex: number | null;
   isLastQuestion: boolean;
   isComplete: boolean;
   canAdvance: boolean;
@@ -126,15 +128,23 @@ export function withdrawDisplacedCustomAnswerFromPrompt(
   return after.length === 0 ? before.slice(0, -DISPLACED_ANSWER_SEPARATOR.length) : before + after;
 }
 
-function countAnsweredPendingUserInputQuestions(
+function summarizePendingUserInputAnswers(
   questions: ReadonlyArray<UserInputQuestion>,
   draftAnswers: Record<string, PendingUserInputDraftAnswer>,
-): number {
-  return questions.reduce((count, question) => {
-    return resolvePendingUserInputAnswer(question, draftAnswers[question.id]) !== null
-      ? count + 1
-      : count;
-  }, 0);
+): {
+  answeredQuestionIds: ReadonlyArray<string>;
+  firstUnansweredQuestionIndex: number | null;
+} {
+  const answeredQuestionIds: string[] = [];
+  let firstUnansweredQuestionIndex: number | null = null;
+  questions.forEach((question, index) => {
+    if (resolvePendingUserInputAnswer(question, draftAnswers[question.id]) !== null) {
+      answeredQuestionIds.push(question.id);
+    } else if (firstUnansweredQuestionIndex === null) {
+      firstUnansweredQuestionIndex = index;
+    }
+  });
+  return { answeredQuestionIds, firstUnansweredQuestionIndex };
 }
 
 export function derivePendingUserInputProgress<Q extends UserInputQuestion>(
@@ -151,7 +161,11 @@ export function derivePendingUserInputProgress<Q extends UserInputQuestion>(
     : null;
   const customAnswer =
     activeQuestion?.allowCustomAnswer === false ? "" : (activeDraft?.customAnswer ?? "");
-  const answeredQuestionCount = countAnsweredPendingUserInputQuestions(questions, draftAnswers);
+  const { answeredQuestionIds, firstUnansweredQuestionIndex } = summarizePendingUserInputAnswers(
+    questions,
+    draftAnswers,
+  );
+  const answeredQuestionCount = answeredQuestionIds.length;
   const isLastQuestion =
     questions.length === 0 ? true : normalizedQuestionIndex >= questions.length - 1;
 
@@ -167,6 +181,8 @@ export function derivePendingUserInputProgress<Q extends UserInputQuestion>(
     usingCustomAnswer:
       (activeQuestion?.initialAnswer !== undefined ? customAnswer : customAnswer.trim()).length > 0,
     answeredQuestionCount,
+    answeredQuestionIds,
+    firstUnansweredQuestionIndex,
     isLastQuestion,
     isComplete: buildPendingUserInputAnswers(questions, draftAnswers) !== null,
     canAdvance: resolvedAnswer !== null,

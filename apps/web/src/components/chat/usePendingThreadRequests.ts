@@ -642,6 +642,12 @@ export function usePendingThreadRequests(input: {
     if (activePendingProgress.isLastQuestion) {
       if (activePendingResolvedAnswers) {
         void onRespondToUserInput(activePendingUserInput.requestId, activePendingResolvedAnswers);
+      } else if (
+        activePendingProgress.canAdvance &&
+        activePendingProgress.firstUnansweredQuestionIndex !== null &&
+        activePendingProgress.firstUnansweredQuestionIndex !== activePendingProgress.questionIndex
+      ) {
+        setActivePendingUserInputQuestionIndex(activePendingProgress.firstUnansweredQuestionIndex);
       }
       return;
     }
@@ -661,6 +667,21 @@ export function usePendingThreadRequests(input: {
     onPreviousActivePendingUserInputQuestion,
   );
 
+  const onSelectActivePendingUserInputQuestionIndex = (nextQuestionIndex: number) => {
+    if (!activePendingUserInput || activePendingUserInput.questions.length === 0) {
+      return;
+    }
+    const rawIndex = Number.isFinite(nextQuestionIndex) ? Math.trunc(nextQuestionIndex) : 0;
+    const clampedIndex = Math.max(
+      0,
+      Math.min(rawIndex, activePendingUserInput.questions.length - 1),
+    );
+    setActivePendingUserInputQuestionIndex(clampedIndex);
+  };
+  const onSelectActivePendingUserInputQuestionIndexStable = useStableCallback(
+    onSelectActivePendingUserInputQuestionIndex,
+  );
+
   return {
     pendingApprovals,
     pendingUserInputs,
@@ -675,5 +696,6 @@ export function usePendingThreadRequests(input: {
     onAdvanceActivePendingUserInput,
     onAdvanceActivePendingUserInputStable,
     onPreviousActivePendingUserInputQuestion: onPreviousActivePendingUserInputQuestionStable,
+    onSelectActivePendingUserInputQuestionIndex: onSelectActivePendingUserInputQuestionIndexStable,
   };
 }
