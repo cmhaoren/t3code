@@ -62,6 +62,13 @@ export function antigravityToolOutlivesPrompt(toolCall: AcpToolCallState): boole
   return toolCall.kind === "execute" && !(Predicate.isObject(input) && input.IsDaemon === true);
 }
 
+/** Non-daemon shell commands run asynchronously and can hang indefinitely on interactive prompts. */
+export function antigravityToolCanStall(toolCall: AcpToolCallState): boolean {
+  if (toolCall.title !== undefined && ANTIGRAVITY_SCHEDULE_TITLES.has(toolCall.title)) return false;
+  const input = toolCall.data.rawInput;
+  return toolCall.kind === "execute" && !(Predicate.isObject(input) && input.IsDaemon === true);
+}
+
 /** Native questions share the permission method, but their choices are not approvals. */
 export function isAntigravityUserInputRequest(
   request: EffectAcpSchema.RequestPermissionRequest,
@@ -386,20 +393,28 @@ export const extractAntigravityElicitationForm: NonNullable<
       for (const question of questions) {
         const answer = Object.hasOwn(answers, question.id) ? answers[question.id] : undefined;
         const companionId = `${question.id}${otherCompanionSuffix}`;
+        // The composer sends a selected option plus a note as `<option>\n\n<note>`, and a
+        // multi-select answer as the selected options followed by the note in one array.
         if (question.multiSelect === true) {
           if (Array.isArray(answer)) {
             const values: string[] = [];
+            const notes: string[] = [];
             const seen = new Set<string>();
             for (const item of answer) {
-              if (typeof item !== "string" || findChoice(question.options, item) === undefined) {
-                return { action: "cancel" };
+              if (typeof item !== "string") return { action: "cancel" };
+              if (findChoice(question.options, item) !== undefined) {
+                if (seen.has(item)) continue;
+                seen.add(item);
+                values.push(item);
+                continue;
               }
-              if (seen.has(item)) continue;
-              seen.add(item);
-              values.push(item);
+              if (!item.trim()) return { action: "cancel" };
+              notes.push(item.trim());
             }
+            // Pure custom text arrives as a string, so an array must carry a selected option.
             if (values.length === 0) return { action: "cancel" };
             entries.push([question.id, values]);
+            if (notes.length > 0) entries.push([companionId, notes.join("\n\n")]);
             continue;
           }
           if (typeof answer !== "string") return { action: "cancel" };
@@ -414,9 +429,19 @@ export const extractAntigravityElicitationForm: NonNullable<
           if (attached !== undefined && split !== undefined) {
             entries.push([question.id, [split.prefix]]);
             entries.push([companionId, `${attached.label}${split.suffix}`]);
-          } else {
-            entries.push([companionId, answer]);
+            continue;
           }
+          const marker = answer.indexOf("\n\n");
+          if (marker >= 0) {
+            const prefix = answer.slice(0, marker);
+            const note = answer.slice(marker + 2).trim();
+            if (findChoice(question.options, prefix) !== undefined && note.length > 0) {
+              entries.push([question.id, [prefix]]);
+              entries.push([companionId, note]);
+              continue;
+            }
+          }
+          entries.push([companionId, answer]);
           continue;
         }
         if (typeof answer !== "string") return { action: "cancel" };
@@ -424,16 +449,26 @@ export const extractAntigravityElicitationForm: NonNullable<
           entries.push([question.id, answer]);
           continue;
         }
-        if (!answer.trim()) return { action: "cancel" };
         const split = splitAttachments(answer);
         const attached =
           split === undefined ? undefined : findChoice(question.options, split.prefix);
         if (attached !== undefined && split !== undefined) {
           entries.push([question.id, split.prefix]);
           entries.push([companionId, `${attached.label}${split.suffix}`]);
-        } else {
-          entries.push([companionId, answer]);
+          continue;
         }
+        const marker = answer.indexOf("\n\n");
+        if (marker >= 0) {
+          const prefix = answer.slice(0, marker);
+          const note = answer.slice(marker + 2).trim();
+          if (findChoice(question.options, prefix) !== undefined && note.length > 0) {
+            entries.push([question.id, prefix]);
+            entries.push([companionId, note]);
+            continue;
+          }
+        }
+        if (!answer.trim()) return { action: "cancel" };
+        entries.push([companionId, answer]);
       }
       return { action: "accept", content: Object.fromEntries(entries) };
     },

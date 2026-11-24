@@ -51,13 +51,37 @@ describe("resolvePendingUserInputAnswer", () => {
     ).toEqual({ customAnswer: "" });
   });
 
-  it("prefers a custom answer over selected options", () => {
+  it("combines a selected option with a supplementary custom note", () => {
     expect(
       resolvePendingUserInputAnswer(singleSelectQuestion, {
         selectedOptionValues: ["Orchestration-first"],
         customAnswer: "Keep the existing envelope for one release",
       }),
+    ).toBe("Orchestration-first\n\nKeep the existing envelope for one release");
+  });
+
+  it("submits a custom note on its own when no option is selected", () => {
+    expect(
+      resolvePendingUserInputAnswer(singleSelectQuestion, {
+        customAnswer: "Keep the existing envelope for one release",
+      }),
     ).toBe("Keep the existing envelope for one release");
+  });
+
+  it("appends a custom note to every multi-select option", () => {
+    expect(
+      resolvePendingUserInputAnswer(
+        {
+          ...singleSelectQuestion,
+          multiSelect: true,
+          options: [{ label: "Server" }, { label: "Web" }],
+        },
+        {
+          selectedOptionValues: ["Server", "Web"],
+          customAnswer: "Also mobile",
+        },
+      ),
+    ).toEqual(["Server", "Web", "Also mobile"]);
   });
 
   it("does not replace a required choice with a custom answer", () => {
@@ -153,6 +177,38 @@ describe("togglePendingUserInputOptionSelection", () => {
       first,
     );
   });
+
+  it("keeps a custom note when the user selects and clears options", () => {
+    const question = {
+      ...singleSelectQuestion,
+      options: [{ label: "Incremental" }, { label: "Rewrite" }],
+    };
+    const withNote = { customAnswer: "first try" };
+    const selected = togglePendingUserInputOptionSelection(question, withNote, "Incremental");
+    expect(selected).toEqual({
+      customAnswer: "first try",
+      selectedOptionValues: ["Incremental"],
+    });
+    expect(isPendingUserInputOptionSelected(question, selected, "Incremental")).toBe(true);
+    expect(togglePendingUserInputOptionSelection(question, selected, "Incremental")).toEqual({
+      customAnswer: "first try",
+    });
+
+    const multiQuestion = { ...question, multiSelect: true };
+    const multiSelected = togglePendingUserInputOptionSelection(
+      multiQuestion,
+      withNote,
+      "Incremental",
+    );
+    expect(multiSelected).toEqual({
+      customAnswer: "first try",
+      selectedOptionValues: ["Incremental"],
+    });
+    expect(togglePendingUserInputOptionSelection(multiQuestion, multiSelected, "Rewrite")).toEqual({
+      customAnswer: "first try",
+      selectedOptionValues: ["Incremental", "Rewrite"],
+    });
+  });
 });
 
 describe("setPendingUserInputCustomAnswer", () => {
@@ -166,6 +222,28 @@ describe("setPendingUserInputCustomAnswer", () => {
         result: { selectedOptionValues: ["second"], customAnswer: "stale draft" },
       }),
     ).toEqual({ result: "second" });
+  });
+
+  it("keeps selected options alongside a note and clears them for an initial answer", () => {
+    expect(
+      setPendingUserInputCustomAnswer(
+        singleSelectQuestion,
+        { selectedOptionValues: ["Orchestration-first"] },
+        "Keep the existing envelope for one release",
+      ),
+    ).toEqual({
+      customAnswer: "Keep the existing envelope for one release",
+      selectedOptionValues: ["Orchestration-first"],
+    });
+
+    const initialAnswerQuestion = { ...singleSelectQuestion, initialAnswer: "Proposed message" };
+    expect(
+      setPendingUserInputCustomAnswer(
+        initialAnswerQuestion,
+        { selectedOptionValues: ["Orchestration-first"] },
+        "Edited message",
+      ),
+    ).toEqual({ customAnswer: "Edited message" });
   });
 });
 

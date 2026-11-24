@@ -63,31 +63,35 @@ export function resolvePendingUserInputAnswer(
   draft: PendingUserInputDraftAnswer | undefined,
 ): PendingUserInputAnswer | null {
   if (draft?.attachmentsBlocked) return null;
-  const customAnswer =
-    question.allowCustomAnswer === false
-      ? null
-      : question.initialAnswer !== undefined
-        ? (draft?.customAnswer ?? null)
-        : normalizeDraftAnswer(draft?.customAnswer);
-  if (customAnswer !== null && customAnswer.length > 0) {
-    return customAnswer;
-  }
-  if (question.required === false && question.options.length === 0) {
-    return "";
+  if (question.initialAnswer !== undefined) {
+    const literal = draft?.customAnswer ?? null;
+    if (literal !== null && literal.length > 0) return literal;
+    return (
+      literal ??
+      (question.allowCustomAnswer !== false && (draft?.attachmentCount ?? 0) > 0 ? "" : null)
+    );
   }
 
+  const customAnswer =
+    question.allowCustomAnswer === false ? null : normalizeDraftAnswer(draft?.customAnswer);
   const selectedOptionValues = normalizeSelectedOptionValues(question, draft?.selectedOptionValues);
   if (question.multiSelect) {
-    return selectedOptionValues.length > 0
-      ? selectedOptionValues
-      : (customAnswer ??
-          (question.allowCustomAnswer !== false && (draft?.attachmentCount ?? 0) > 0 ? "" : null));
+    if (selectedOptionValues.length > 0 && customAnswer !== null) {
+      return [...selectedOptionValues, customAnswer];
+    }
+    if (selectedOptionValues.length > 0) return selectedOptionValues;
+    if (customAnswer !== null) return customAnswer;
+    if (question.allowCustomAnswer !== false && (draft?.attachmentCount ?? 0) > 0) return "";
+    return null;
   }
-  return (
-    selectedOptionValues[0] ??
-    customAnswer ??
-    (question.allowCustomAnswer !== false && (draft?.attachmentCount ?? 0) > 0 ? "" : null)
-  );
+
+  const selected = selectedOptionValues[0];
+  if (selected !== undefined && customAnswer !== null) return `${selected}\n\n${customAnswer}`;
+  if (selected !== undefined) return selected;
+  if (customAnswer !== null) return customAnswer;
+  if (question.required === false && question.options.length === 0) return "";
+  if (question.allowCustomAnswer !== false && (draft?.attachmentCount ?? 0) > 0) return "";
+  return null;
 }
 
 export function setPendingUserInputCustomAnswer(
@@ -99,13 +103,14 @@ export function setPendingUserInputCustomAnswer(
     return draft ?? {};
   }
 
-  const selectedOptionValues =
-    question.initialAnswer !== undefined || customAnswer.trim().length > 0
-      ? undefined
-      : normalizeSelectedOptionValues(question, draft?.selectedOptionValues);
+  if (question.initialAnswer !== undefined) {
+    return { customAnswer };
+  }
+
+  const selectedOptionValues = normalizeSelectedOptionValues(question, draft?.selectedOptionValues);
   return {
     customAnswer,
-    ...(selectedOptionValues && selectedOptionValues.length > 0 ? { selectedOptionValues } : {}),
+    ...(selectedOptionValues.length > 0 ? { selectedOptionValues } : {}),
   };
 }
 
@@ -114,10 +119,6 @@ export function isPendingUserInputOptionSelected(
   draft: PendingUserInputDraftAnswer | undefined,
   optionValue: string,
 ): boolean {
-  if (question.allowCustomAnswer !== false && normalizeDraftAnswer(draft?.customAnswer)) {
-    return false;
-  }
-
   const resolvedOptionValue = resolvePendingUserInputOptionValue(question, optionValue);
   return (
     resolvedOptionValue !== null &&
@@ -127,7 +128,10 @@ export function isPendingUserInputOptionSelected(
   );
 }
 
-/** Toggles an offered option. An unknown option returns the same draft. */
+/**
+ * Toggles an offered option and keeps any custom note alongside it. An unknown
+ * option returns the same draft.
+ */
 export function togglePendingUserInputOptionSelection(
   question: PendingUserInputQuestion,
   draft: PendingUserInputDraftAnswer | undefined,
@@ -137,6 +141,11 @@ export function togglePendingUserInputOptionSelection(
   if (resolvedOptionValue === null) {
     return draft ?? {};
   }
+
+  const preservedCustom =
+    question.allowCustomAnswer === false || !draft?.customAnswer
+      ? {}
+      : { customAnswer: draft.customAnswer };
 
   if (question.multiSelect) {
     const selectedOptionValues = normalizeSelectedOptionValues(
@@ -148,17 +157,19 @@ export function togglePendingUserInputOptionSelection(
       : [...selectedOptionValues, resolvedOptionValue];
 
     return {
-      customAnswer: "",
+      ...preservedCustom,
       ...(nextSelectedOptionValues.length > 0
         ? { selectedOptionValues: nextSelectedOptionValues }
         : {}),
     };
   }
 
-  return {
-    customAnswer: "",
-    selectedOptionValues: [resolvedOptionValue],
-  };
+  const selectedOptionValues = normalizeSelectedOptionValues(question, draft?.selectedOptionValues);
+  if (selectedOptionValues.includes(resolvedOptionValue)) {
+    return { ...preservedCustom };
+  }
+
+  return { ...preservedCustom, selectedOptionValues: [resolvedOptionValue] };
 }
 
 /** Every question's answer keyed by question id, or null while any is unanswered. */

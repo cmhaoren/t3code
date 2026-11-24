@@ -11,9 +11,9 @@ import {
   ListIcon,
   Maximize2Icon,
   Minimize2Icon,
+  PenLineIcon,
 } from "lucide-react";
 import { BackgroundThreadContext } from "./backgroundThread";
-import { useStableCallback } from "~/hooks/useStableCallback";
 import { type PendingUserInput } from "../../session-logic";
 import {
   normalizeSelectedOptionValues,
@@ -137,7 +137,8 @@ interface PendingUserInputPanelProps {
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
   onToggleOption: (questionId: string, optionValue: string) => void;
-  onAdvance: () => void;
+  onChangeCustomAnswer?: ((questionId: string, value: string) => void) | undefined;
+  onAdvance?: (() => void) | undefined;
   onDismiss: (requestId: RuntimeRequestId) => void;
   onSelectQuestionIndex?: ((questionIndex: number) => void) | undefined;
   viewMode?: PendingUserInputViewMode | undefined;
@@ -153,7 +154,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   answers,
   questionIndex,
   onToggleOption,
-  onAdvance,
+  onChangeCustomAnswer,
   onDismiss,
   onSelectQuestionIndex,
   viewMode,
@@ -174,7 +175,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       answers={answers}
       questionIndex={questionIndex}
       onToggleOption={onToggleOption}
-      onAdvance={onAdvance}
+      onChangeCustomAnswer={onChangeCustomAnswer}
       onDismiss={onDismiss}
       onSelectQuestionIndex={onSelectQuestionIndex}
       viewMode={viewMode}
@@ -192,7 +193,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   answers,
   questionIndex,
   onToggleOption,
-  onAdvance,
+  onChangeCustomAnswer,
   onDismiss,
   onSelectQuestionIndex,
   viewMode: viewModeProp,
@@ -206,7 +207,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
   onToggleOption: (questionId: string, optionValue: string) => void;
-  onAdvance: () => void;
+  onChangeCustomAnswer?: ((questionId: string, value: string) => void) | undefined;
   onDismiss: (requestId: RuntimeRequestId) => void;
   onSelectQuestionIndex?: ((questionIndex: number) => void) | undefined;
   viewMode?: PendingUserInputViewMode | undefined;
@@ -216,12 +217,6 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   // Message-mode requests remain answerable after their provider turn ends.
   const canRespond = prompt.responseCapability !== "not_resumable";
   const responseDisabled = disabled || isResponding || !canRespond;
-  const autoAdvanceTimerRef = useRef<number | null>(null);
-  const advance = useStableCallback(onAdvance);
-  const [optimisticSingleSelect, setOptimisticSingleSelect] = useState<{
-    questionId: string;
-    optionValue: string;
-  } | null>(null);
   const [collapsedQuestionId, setCollapsedQuestionId] = useState<string | null>(null);
   const [uncontrolledViewMode, setUncontrolledViewMode] = useState<PendingUserInputViewMode>(
     readPendingUserInputViewModePreference,
@@ -238,46 +233,13 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   const effectiveViewMode = hasMultipleQuestions ? viewMode : "single";
   const isCollapsed = collapsedQuestionId !== null && collapsedQuestionId === activeQuestion?.id;
 
-  if (optimisticSingleSelect) {
-    const question = prompt.questions.find(
-      (candidate) => candidate.id === optimisticSingleSelect.questionId,
-    );
-    const answer = question ? answers[question.id] : undefined;
-    const customAnswer = question?.allowCustomAnswer === false ? "" : (answer?.customAnswer ?? "");
-    const selectedOptionValues = question
-      ? normalizeSelectedOptionValues(question, answer?.selectedOptionValues)
-      : [];
-    if (
-      !question ||
-      question.multiSelect ||
-      (!customAnswer.trim() && selectedOptionValues.includes(optimisticSingleSelect.optionValue))
-    ) {
-      setOptimisticSingleSelect(null);
-    }
-  }
-
-  const clearAutoAdvance = useStableCallback(() => {
-    if (autoAdvanceTimerRef.current !== null) {
-      window.clearTimeout(autoAdvanceTimerRef.current);
-      autoAdvanceTimerRef.current = null;
-    }
-  });
-
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- clears the auto-advance timer when the question changes, input is disabled, or the panel unmounts
-  useEffect(() => {
-    if (disabled || activeQuestion?.id === undefined) clearAutoAdvance();
-    return clearAutoAdvance;
-  }, [activeQuestion?.id, clearAutoAdvance, disabled]);
-
   const handleSelectQuestionIndex = (nextIndex: number) => {
-    clearAutoAdvance();
     const rawIndex = Number.isFinite(nextIndex) ? Math.trunc(nextIndex) : 0;
     const clampedIndex = Math.max(0, Math.min(rawIndex, prompt.questions.length - 1));
     onSelectQuestionIndex?.(clampedIndex);
   };
 
   const handleToggleViewMode = () => {
-    clearAutoAdvance();
     const nextViewMode = viewMode === "all" ? "single" : "all";
     onViewModeChange?.(nextViewMode);
     if (viewModeProp === undefined) {
@@ -303,20 +265,9 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     if (targetQuestionIndex !== undefined && targetQuestionIndex !== safeQuestionIndex) {
       handleSelectQuestionIndex(targetQuestionIndex);
     }
-    if (targetQuestion.multiSelect) {
-      clearAutoAdvance();
-      onToggleOption(questionId, optionValue);
-      return;
-    }
-    setOptimisticSingleSelect({ questionId, optionValue });
+    // Selecting a single-select option only records the answer. Advancing or
+    // submitting stays an explicit user action so a misclick never sends it.
     onToggleOption(questionId, optionValue);
-    // "All" view keeps every card visible, so advancing would skip the card the user is reading.
-    if (effectiveViewMode !== "single") return;
-    clearAutoAdvance();
-    autoAdvanceTimerRef.current = window.setTimeout(() => {
-      autoAdvanceTimerRef.current = null;
-      advance();
-    }, 200);
   };
 
   const selectOptionFromShortcut = useEffectEvent(handleOptionSelection);
@@ -326,7 +277,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   useEffect(() => {
     if (!activeQuestion || responseDisabled || isCollapsed || backgroundThread) return;
     const handler = (event: globalThis.KeyboardEvent) => {
-      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.defaultPrevented || event.isComposing) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target;
       if (isInSideChatPane(target)) return;
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
@@ -404,7 +356,11 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   const renderQuestionBlock = (
     question: ThreadUserInputQuestion,
     presentation: QuestionPresentation,
-    options: { showShortcuts: boolean; onSelect: (optionValue: string) => void },
+    options: {
+      showShortcuts: boolean;
+      questionIndex: number;
+      onSelect: (optionValue: string) => void;
+    },
   ) => {
     const answer = answers[question.id];
     const selectedOptionValues = normalizeSelectedOptionValues(
@@ -412,11 +368,6 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       answer?.selectedOptionValues,
     );
     const customAnswer = questionCustomAnswer(question);
-    const hasCustomAnswer = customAnswer.trim().length > 0;
-    const optimisticValue =
-      optimisticSingleSelect?.questionId === question.id
-        ? optimisticSingleSelect.optionValue
-        : null;
     return (
       <>
         <ChatMarkdown
@@ -438,9 +389,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               : null;
             const isRecommended =
               parsedLabel.isRecommended || Boolean(parsedDescription?.isRecommended);
-            const isSelected =
-              optimisticValue === optionValue ||
-              (!hasCustomAnswer && selectedOptionValues.includes(optionValue));
+            const isSelected = selectedOptionValues.includes(optionValue);
             return (
               <div key={`${question.id}:${optionValue}`}>
                 <button
@@ -515,6 +464,21 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
             );
           })}
         </div>
+        {question.allowCustomAnswer !== false ? (
+          <PendingCustomAnswerInput
+            questionId={question.id}
+            value={customAnswer}
+            hasOptions={question.options.length > 0}
+            questionTextAlign={questionTextAlign}
+            disabled={disabled || isResponding}
+            onChange={(questionId, value) => onChangeCustomAnswer?.(questionId, value)}
+            onFocus={() => {
+              if (options.questionIndex !== safeQuestionIndex) {
+                handleSelectQuestionIndex(options.questionIndex);
+              }
+            }}
+          />
+        ) : null}
       </>
     );
   };
@@ -709,11 +673,9 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           <ComposerBanner.Body className="px-5 pt-2 pb-2.5 wrap-anywhere">
             {effectiveViewMode === "all" ? (
               <div className="space-y-3">
-                {/* oxlint-disable-next-line react/refs -- the callback ref only stores card elements after commit; no ref value is read while rendering */}
                 {prompt.questions.map((question, index) => {
                   const isActive = index === safeQuestionIndex;
                   const isAnswered = answeredQuestionIdSet.has(question.id);
-                  const questionCustomAnswerValue = questionCustomAnswer(question);
                   const presentation = questionPresentations[index] ?? {
                     header: question.header,
                     isNumberedHeader: false,
@@ -760,27 +722,26 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                       </div>
                       {renderQuestionBlock(question, presentation, {
                         showShortcuts: isActive,
+                        questionIndex: index,
                         onSelect: (optionValue) =>
                           handleOptionSelection(question.id, optionValue, index),
                       })}
-                      {questionCustomAnswerValue.trim().length > 0 ? (
-                        <div className="mt-2 rounded-md border border-border/50 bg-muted/30 px-2.5 py-1.5 text-xs text-foreground/80">
-                          <span className="font-medium text-muted-foreground">
-                            {gt("Custom answer")}:{" "}
-                          </span>
-                          <span>{questionCustomAnswerValue}</span>
-                        </div>
-                      ) : null}
                     </div>
                   );
                 })}
               </div>
             ) : (
-              // oxlint-disable-next-line react/refs -- renderQuestionBlock only renders; the card ref map is written by callback refs after commit
-              renderQuestionBlock(activeQuestion, activePresentation, {
-                showShortcuts: true,
-                onSelect: (optionValue) => handleOptionSelection(activeQuestion.id, optionValue),
-              })
+              <div
+                key={activeQuestion.id}
+                data-pending-user-input-question-stage
+                className="pending-question-enter"
+              >
+                {renderQuestionBlock(activeQuestion, activePresentation, {
+                  showShortcuts: true,
+                  questionIndex: safeQuestionIndex,
+                  onSelect: (optionValue) => handleOptionSelection(activeQuestion.id, optionValue),
+                })}
+              </div>
             )}
           </ComposerBanner.Body>
         </ComposerBanner.Scroll>
@@ -789,8 +750,81 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   );
 });
 
+const CUSTOM_ANSWER_MAX_HEIGHT_PX = 96;
+
+/**
+ * The note field sits directly under a question's options so a note and a selected option can
+ * coexist. It grows with its content up to a fixed height, then scrolls.
+ */
+function PendingCustomAnswerInput({
+  questionId,
+  value,
+  hasOptions,
+  questionTextAlign,
+  disabled,
+  onChange,
+  onFocus,
+}: {
+  questionId: string;
+  value: string;
+  hasOptions: boolean;
+  questionTextAlign: string;
+  disabled: boolean;
+  onChange: (questionId: string, value: string) => void;
+  onFocus: () => void;
+}) {
+  const gt = useGT();
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const placeholder = hasOptions
+    ? gt("Add a note or type your own answer...")
+    : gt("Type your answer...");
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- mirrors the textarea's content height into its inline style so multiline answers grow in place
+  useEffect(() => {
+    const element = inputRef.current;
+    if (!element) return;
+    element.style.height = "auto";
+    const nextHeight = Math.min(element.scrollHeight, CUSTOM_ANSWER_MAX_HEIGHT_PX);
+    element.style.height = `${nextHeight}px`;
+    element.style.overflowY =
+      element.scrollHeight > CUSTOM_ANSWER_MAX_HEIGHT_PX ? "auto" : "hidden";
+  }, [
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- re-measures whenever the controlled value changes, including draft edits made outside this field
+    value,
+  ]);
+
+  return (
+    <div className="mt-2" onClick={(event) => event.stopPropagation()}>
+      <div
+        className={cn(
+          "flex items-start gap-2 rounded-lg border border-border/60 bg-background/60 px-2.5 py-1.5 transition-colors focus-within:border-primary/40",
+          questionTextAlign,
+        )}
+      >
+        <PenLineIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        <textarea
+          ref={inputRef}
+          rows={1}
+          dir="auto"
+          value={value}
+          disabled={disabled}
+          data-pending-question-custom-input={questionId}
+          aria-label={placeholder}
+          placeholder={placeholder}
+          onChange={(event) => onChange(questionId, event.target.value)}
+          onFocus={onFocus}
+          className={cn(
+            "max-h-24 min-h-5 w-full resize-none bg-transparent text-[13px] leading-snug text-foreground outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60",
+            questionTextAlign,
+          )}
+        />
+      </div>
+    </div>
+  );
+}
+
 // Drawn with ui/radio-group's look instead of using its Radio: Radio only checks inside a
-// RadioGroup, whose arrow keys select options and would trip the single-select auto-advance.
+// RadioGroup, whose arrow keys move the selection for the user.
 function OptionRadio({ checked }: { checked: boolean }) {
   return (
     <span

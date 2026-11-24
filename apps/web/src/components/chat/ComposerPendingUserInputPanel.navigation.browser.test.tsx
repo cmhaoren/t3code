@@ -152,64 +152,47 @@ it("retains answers, selections and question position after leaving chat, includ
   expect(requests).toMatchObject(expected);
 });
 
-it("tells the user when an option click moves their typed answer into the hidden composer draft", async () => {
+it("keeps custom notes and selected options together without moving text to the composer draft", async () => {
   using _timers = fakeTimers();
-  const environmentId = EnvironmentId.make("displaced-environment");
+  const environmentId = EnvironmentId.make("combined-answer-environment");
   const draftTarget = { environmentId, threadId: threadRef.threadId };
-  const draftPrompt = () => useComposerDraftStore.getState().getComposerDraft(draftTarget)?.prompt;
+  const draftPrompt = () =>
+    useComposerDraftStore.getState().getComposerDraft(draftTarget)?.prompt ?? "";
   using toast = vi.spyOn(toastManager, "add");
-  const probe = (threadId: ThreadId) => (
-    <PendingRequestsProbe environmentId={environmentId} projection={questionProjection(threadId)} />
-  );
-  await using screen = await render(probe(threadRef.threadId));
-
-  await act(() => requests.onSelectActivePendingUserInputOption("question-0", "Incremental"));
-  expect(toast).not.toHaveBeenCalled();
-
-  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "first try"));
-  await act(() => requests.onSelectActivePendingUserInputOption("question-0", "Incremental"));
-  expect(draftPrompt()).toBe("first try");
-  expect(toast).toHaveBeenCalledTimes(1);
-  expect(toast).toHaveBeenCalledWith(
-    expect.objectContaining({
-      type: "info",
-      title: "Your typed text was set aside",
-      description: "It will be back in the composer once the question is answered.",
-      data: { threadRef: draftTarget },
-    }),
-  );
-
-  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "second try"));
-  expect(draftPrompt()).toBe("first try");
-  expect(requests.activePendingDraftAnswers["question-0"]).toMatchObject({
-    customAnswer: "second try",
-  });
-  expect(toast).toHaveBeenCalledTimes(1);
-
-  // The hook outlives a thread switch; text set aside in another thread is in another draft.
-  await screen.rerender(probe(ThreadId.make("other-thread")));
-  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "elsewhere"));
-  await act(() => requests.onSelectActivePendingUserInputOption("question-0", "Incremental"));
-  await screen.rerender(probe(threadRef.threadId));
-
-  // regression: #35205 undo puts the set-aside text back, so the draft must not keep a copy to resend
-  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "first try"));
-  expect(draftPrompt() ?? "").toBe("");
-
-  // Text set aside into a queued-message edit draft never withdraws from the thread draft.
-  await screen.rerender(
+  const probe = () => (
     <PendingRequestsProbe
       environmentId={environmentId}
       projection={questionProjection(threadRef.threadId)}
-      draftTarget={DraftId.make("queued-edit")}
-    />,
+    />
   );
-  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "foo"));
+  await using screen = await render(probe());
+
+  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "first try"));
+  expect(draftPrompt()).toBe("");
+
   await act(() => requests.onSelectActivePendingUserInputOption("question-0", "Incremental"));
-  await screen.rerender(probe(threadRef.threadId));
-  useComposerDraftStore.getState().setPrompt(draftTarget, "foo");
-  await act(() => requests.onChangeActivePendingUserInputCustomAnswer("question-0", "foo"));
-  expect(draftPrompt()).toBe("foo");
+  expect(toast).not.toHaveBeenCalled();
+  expect(draftPrompt()).toBe("");
+  expect(requests.activePendingDraftAnswers["question-0"]).toMatchObject({
+    selectedOptionValues: ["Incremental"],
+    customAnswer: "first try",
+  });
+
+  // The other questions are answered so the resolved answer map is complete.
+  await act(() => requests.onSelectActivePendingUserInputOption("question-1", "Incremental"));
+  await act(() => requests.onSelectActivePendingUserInputOption("question-2", "Incremental"));
+  await screen.rerender(probe());
+  expect(requests.activePendingResolvedAnswers?.["question-0"]).toBe("Incremental\n\nfirst try");
+
+  // Clicking the selected option again clears it and keeps the note.
+  await act(() => requests.onSelectActivePendingUserInputOption("question-0", "Incremental"));
+  expect(requests.activePendingDraftAnswers["question-0"]).toMatchObject({
+    customAnswer: "first try",
+  });
+  expect(requests.activePendingDraftAnswers["question-0"]?.selectedOptionValues ?? []).toEqual([]);
+  expect(requests.activePendingResolvedAnswers?.["question-0"]).toBe("first try");
+  expect(toast).not.toHaveBeenCalled();
+  expect(draftPrompt()).toBe("");
 });
 
 function QuestionPositionProbe(props: ProbeProps) {

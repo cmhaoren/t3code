@@ -8,6 +8,7 @@ import {
   extractAntigravityUserInputQuestion,
   antigravityApprovalOptions,
   antigravitySubagentOutput,
+  antigravityToolCanStall,
   antigravityToolOutlivesPrompt,
   classifyAntigravitySubagentToolCall,
   isAntigravityUserInputRequest,
@@ -913,6 +914,51 @@ describe("Antigravity elicitation questions", () => {
     });
   });
 
+  it("keeps a supplementary note beside a single-select choice", () => {
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.respond({ q1: "1\n\nPlease keep it compact", q2: ["2"], q3: "4" })).toEqual({
+      action: "accept",
+      content: {
+        q1: "1",
+        q1_other: "Please keep it compact",
+        q2: ["2"],
+        q3: "4",
+      },
+    });
+  });
+
+  it("keeps a note that also carries an attachment beside a single-select choice", () => {
+    const attachment = '\n\nAttached image "shot.png": "/tmp/shot.png"';
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(
+      form?.respond({ q1: `1\n\nPlease keep it compact${attachment}`, q2: ["2"], q3: "4" }),
+    ).toEqual({
+      action: "accept",
+      content: {
+        q1: "1",
+        q1_other: `Please keep it compact${attachment}`,
+        q2: ["2"],
+        q3: "4",
+      },
+    });
+  });
+
+  it("keeps a supplementary note beside multi-select choices", () => {
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.respond({ q1: "1", q2: ["2", "3", "Also check Windows"], q3: "4" })).toEqual({
+      action: "accept",
+      content: {
+        q1: "1",
+        q2: ["2", "3"],
+        q2_other: "Also check Windows",
+        q3: "4",
+      },
+    });
+  });
+
   it("cancels incomplete or unknown answers", () => {
     const form = extractAntigravityElicitationForm(threeQuestionForm());
 
@@ -1018,5 +1064,33 @@ describe("Antigravity elicitation questions", () => {
         }),
       ),
     ).toBeUndefined();
+  });
+});
+
+describe("Antigravity background command stalls", () => {
+  const toolCall = (overrides: {
+    readonly kind?: string;
+    readonly title?: string;
+    readonly data?: Record<string, unknown>;
+  }) => ({
+    toolCallId: "tool-1",
+    data: overrides.data ?? {},
+    ...(overrides.kind === undefined ? {} : { kind: overrides.kind }),
+    ...(overrides.title === undefined ? {} : { title: overrides.title }),
+  });
+
+  it("watches non-daemon shell commands only", () => {
+    expect(antigravityToolCanStall(toolCall({ kind: "execute", title: "git push" }))).toBe(true);
+    expect(
+      antigravityToolCanStall(
+        toolCall({ kind: "execute", title: "vp run dev", data: { rawInput: { IsDaemon: true } } }),
+      ),
+    ).toBe(false);
+    for (const title of ["Run schedule", "Running schedule"]) {
+      expect(antigravityToolCanStall(toolCall({ kind: "execute", title }))).toBe(false);
+    }
+    for (const kind of ["read", "other"]) {
+      expect(antigravityToolCanStall(toolCall({ kind, title: "Read file" }))).toBe(false);
+    }
   });
 });

@@ -40,6 +40,7 @@ import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityCli
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
+  antigravityToolCanStall,
   antigravityToolOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
@@ -158,7 +159,7 @@ export function makeAntigravityAcpAdapterFlavor(
           options.makeRuntime({
             ...input,
             clientFileReads: true,
-            sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
+            sessionSystemPromptAppend: `${PULL_REQUEST_LINKING_INSTRUCTIONS}\nWhen running a background shell command expected to terminate (such as git push, build, or test), set NotificationTimeoutSeconds so the harness wakes you promptly if it stalls, and pass non-interactive Git/SSH env flags.`,
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
@@ -294,6 +295,12 @@ export function makeAntigravityAcpAdapterFlavor(
     checksVersionAtHandshake: true,
     // Antigravity can leave a prompt open without updates; long tools and approvals pause this.
     promptInactivityTimeout: "15 minutes",
+    // A shell command left running after the prompt settles can wait on input forever.
+    backgroundCommandStallNudge: {
+      after: "5 minutes",
+      maxNudges: 2,
+      isWatchableTool: antigravityToolCanStall,
+    },
     reportsPerTurnPromptUsage: true,
     geminiPromptUsage: true,
     ...(profileDirectory === undefined

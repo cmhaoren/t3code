@@ -4,7 +4,7 @@ import { type ReactNode, useState } from "react";
 import { expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
-import { render } from "../../../test/render";
+import { render, act, fakeTimers } from "../../../test/render";
 import type { PendingUserInput } from "../../session-logic";
 import { Select, SelectTrigger } from "../ui/select";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
@@ -73,10 +73,12 @@ function cleanPendingUserInputPreferences(): Disposable {
 function NavigablePanel({
   answers: initialAnswers = {},
   onToggleOption,
+  onChangeCustomAnswer,
   onAdvance,
 }: {
   answers?: Record<string, PendingUserInputDraftAnswer>;
   onToggleOption?: (questionId: string, optionValue: string) => void;
+  onChangeCustomAnswer?: (questionId: string, value: string) => void;
   onAdvance?: () => void;
 }) {
   const [questionIndex, setQuestionIndex] = useState(0);
@@ -94,6 +96,16 @@ function NavigablePanel({
       },
     }));
   };
+  const changeCustomAnswer = (questionId: string, value: string) => {
+    onChangeCustomAnswer?.(questionId, value);
+    setAnswers((current) => ({
+      ...current,
+      [questionId]: {
+        selectedOptionValues: current[questionId]?.selectedOptionValues ?? [],
+        customAnswer: value,
+      },
+    }));
+  };
   return (
     <ComposerPendingUserInputPanel
       pendingUserInputs={[multiPrompt]}
@@ -103,6 +115,7 @@ function NavigablePanel({
       answers={answers}
       questionIndex={questionIndex}
       onToggleOption={toggleOption}
+      onChangeCustomAnswer={changeCustomAnswer}
       onAdvance={onAdvance ?? (() => {})}
       onDismiss={() => {}}
       onSelectQuestionIndex={setQuestionIndex}
@@ -261,15 +274,10 @@ it("shows every question at once, answers a card, and does not auto-advance", as
   ).toBe("true");
   await expect.element(screen.getByText("1/3 answered")).toBeVisible();
 
-  // "All" mode must not schedule the single-view auto-advance timer at all.
-  const setTimeoutSpy = vi.spyOn(window, "setTimeout");
-  try {
-    await userEvent.click(screen.getByText("Gamma"));
-    expect(setTimeoutSpy.mock.calls.some((call) => call[1] === 200)).toBe(false);
-  } finally {
-    setTimeoutSpy.mockRestore();
-  }
+  // Selecting the last question's option never advances or submits on its own.
+  await userEvent.click(screen.getByText("Gamma"));
   expect(onAdvance).not.toHaveBeenCalled();
+  await expect.element(screen.getByText("Choose for the third question")).toBeVisible();
 
   // The height preference works in all-questions view too.
   const heightToggle = () =>
@@ -398,4 +406,167 @@ it("expands the panel height and remembers it across a remount", async () => {
   await screen.rerender(<NavigablePanel />);
   expect(heightToggle()?.getAttribute("data-pending-user-input-height")).toBe("expanded");
   await expect.element(screen.getByTitle("Restore question panel height")).toBeVisible();
+});
+
+it("selects a single option, marks it pressed, and never advances after a delay", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const onToggleOption = vi.fn();
+  const onAdvance = vi.fn();
+  await using screen = await render(
+    <NavigablePanel onToggleOption={onToggleOption} onAdvance={onAdvance} />,
+  );
+
+  const alpha = screen.getByRole("button", { name: /Alpha/ });
+  using _timers = fakeTimers();
+  await userEvent.click(alpha);
+
+  expect(onToggleOption.mock.calls).toEqual([["question-0", "Alpha"]]);
+  await expect.element(alpha).toHaveAttribute("aria-pressed", "true");
+
+  await act(() => vi.advanceTimersByTime(300));
+  expect(onAdvance).not.toHaveBeenCalled();
+  // The panel stays on the question the user just answered.
+  await expect.element(screen.getByText("Choose for the first question")).toBeVisible();
+  await expect.element(screen.getByText("1/3 answered")).toBeVisible();
+});
+
+it("does not auto-submit when the last question's option is clicked", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const onToggleOption = vi.fn();
+  const onAdvance = vi.fn();
+  await using screen = await render(
+    <NavigablePanel onToggleOption={onToggleOption} onAdvance={onAdvance} />,
+  );
+
+  await screen.getByRole("button", { name: "Next question" }).click();
+  await screen.getByRole("button", { name: "Next question" }).click();
+  await expect.element(screen.getByText("Choose for the third question")).toBeVisible();
+
+  const gamma = screen.getByRole("button", { name: /Gamma/ });
+  using _timers = fakeTimers();
+  await userEvent.click(gamma);
+  expect(onToggleOption.mock.calls).toEqual([["question-2", "Gamma"]]);
+  await expect.element(gamma).toHaveAttribute("aria-pressed", "true");
+
+  await act(() => vi.advanceTimersByTime(300));
+  expect(onAdvance).not.toHaveBeenCalled();
+  await expect.element(screen.getByText("Choose for the third question")).toBeVisible();
+});
+
+it("eases in the single-view stage and remounts it when the question changes", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  await using screen = await render(<NavigablePanel />);
+
+  const stage = () =>
+    screen.container.querySelector<HTMLElement>("[data-pending-user-input-question-stage]");
+  const firstStage = stage();
+  expect(firstStage).not.toBeNull();
+  expect(firstStage?.classList.contains("pending-question-enter")).toBe(true);
+
+  await screen.getByRole("button", { name: "Next question" }).click();
+  await expect.element(screen.getByText("Choose for the second question")).toBeVisible();
+
+  const secondStage = stage();
+  expect(secondStage).not.toBeNull();
+  expect(secondStage).not.toBe(firstStage);
+  expect(secondStage?.classList.contains("pending-question-enter")).toBe(true);
+});
+
+it("renders an inline note field in single view and keeps the option selected while typing", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const onChangeCustomAnswer = vi.fn();
+  await using screen = await render(<NavigablePanel onChangeCustomAnswer={onChangeCustomAnswer} />);
+
+  const input = () =>
+    screen.container.querySelector<HTMLTextAreaElement>(
+      '[data-pending-question-custom-input="question-0"]',
+    );
+  expect(input()).not.toBeNull();
+  expect(input()?.getAttribute("placeholder")).toBe("Add a note or type your own answer...");
+
+  const alpha = screen.getByRole("button", { name: /Alpha/ });
+  await alpha.click();
+  await expect.element(alpha).toHaveAttribute("aria-pressed", "true");
+
+  await userEvent.click(input()!);
+  await userEvent.type(input()!, "Add a note");
+
+  expect(onChangeCustomAnswer).toHaveBeenLastCalledWith("question-0", "Add a note");
+  expect(input()?.value).toBe("Add a note");
+  await expect.element(alpha).toHaveAttribute("aria-pressed", "true");
+});
+
+it("renders the note field in all view, selects the card on focus, and ignores digit shortcuts", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const onToggleOption = vi.fn();
+  const onChangeCustomAnswer = vi.fn();
+  await using screen = await render(
+    <NavigablePanel onToggleOption={onToggleOption} onChangeCustomAnswer={onChangeCustomAnswer} />,
+  );
+
+  await screen.getByTitle("View all questions together").click();
+
+  const input = screen.container.querySelector<HTMLTextAreaElement>(
+    '[data-pending-question-custom-input="question-1"]',
+  );
+  expect(input).not.toBeNull();
+
+  await userEvent.click(input!);
+  expect(
+    screen.container
+      .querySelector('[data-pending-question-card="1"]')
+      ?.getAttribute("data-pending-question-active"),
+  ).toBe("true");
+
+  await userEvent.type(input!, "12");
+
+  // Digits typed in the note stay text and never toggle a numbered option.
+  expect(onToggleOption.mock.calls).toEqual([]);
+  expect(onChangeCustomAnswer).toHaveBeenLastCalledWith("question-1", "12");
+  expect(input?.value).toBe("12");
+});
+
+it("renders the note field for a text-only question", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const textOnlyPrompt: PendingUserInput = {
+    requestId: RuntimeRequestId.make("question-text-only"),
+    createdAt: "2026-10-31T00:00:00.000Z",
+    dismissible: false,
+    responseCapability: "live",
+    questions: [
+      {
+        id: "text-only",
+        header: "Answer",
+        question: "What should the agent focus on?",
+        options: [],
+        multiSelect: false,
+      },
+      {
+        id: "choice-only",
+        header: "Choice",
+        question: "Pick one",
+        options: [{ label: "Yes", description: "Accept it" }],
+        multiSelect: false,
+      },
+    ],
+  };
+  await using screen = await render(
+    <ComposerPendingUserInputPanel
+      pendingUserInputs={[textOnlyPrompt]}
+      cwd={undefined}
+      threadRef={threadRef}
+      respondingRequestIds={[]}
+      answers={{}}
+      questionIndex={0}
+      onToggleOption={vi.fn()}
+      onDismiss={vi.fn()}
+      onSelectQuestionIndex={vi.fn()}
+    />,
+  );
+
+  const textOnlyInput = screen.container.querySelector<HTMLTextAreaElement>(
+    '[data-pending-question-custom-input="text-only"]',
+  );
+  expect(textOnlyInput).not.toBeNull();
+  expect(textOnlyInput?.getAttribute("placeholder")).toBe("Type your answer...");
 });

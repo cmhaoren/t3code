@@ -10,7 +10,6 @@ import {
   derivePendingUserInputProgress,
   projectPendingUserInputAnswer,
   threadContextsReferencedByAnswer,
-  withdrawDisplacedCustomAnswerFromPrompt,
 } from "./pendingUserInput";
 
 describe("projectPendingUserInputAnswer", () => {
@@ -163,6 +162,58 @@ describe("pending user input question progress", () => {
     });
   });
 
+  it("combines a selected option with a custom note", () => {
+    expect(
+      derivePendingUserInputProgress(
+        questions,
+        {
+          scope: {
+            selectedOptionValues: ["Orchestration-first"],
+            customAnswer: "Keep the existing envelope for one release",
+          },
+        },
+        0,
+      ),
+    ).toMatchObject({
+      selectedOptionValues: ["Orchestration-first"],
+      customAnswer: "Keep the existing envelope for one release",
+      resolvedAnswer: "Orchestration-first\n\nKeep the existing envelope for one release",
+      usingCustomAnswer: true,
+      canAdvance: true,
+    });
+  });
+
+  it("appends a custom note to every multi-select option", () => {
+    const question = {
+      id: "surfaces",
+      header: "Surfaces",
+      question: "Which surfaces ship?",
+      options: [
+        { label: "Server", description: "Ship the server" },
+        { label: "Web", description: "Ship the web client" },
+      ],
+      multiSelect: true,
+    } as const;
+    expect(
+      derivePendingUserInputProgress(
+        [question],
+        {
+          surfaces: {
+            selectedOptionValues: ["Server", "Web"],
+            customAnswer: "Also mobile",
+          },
+        },
+        0,
+      ),
+    ).toMatchObject({
+      selectedOptionValues: ["Server", "Web"],
+      customAnswer: "Also mobile",
+      resolvedAnswer: ["Server", "Web", "Also mobile"],
+      canAdvance: true,
+      isComplete: true,
+    });
+  });
+
   it("reports no answered questions and the first question as unanswered", () => {
     expect(derivePendingUserInputProgress(questions, {}, 0)).toMatchObject({
       answeredQuestionIds: [],
@@ -247,42 +298,5 @@ describe("carryDisplacedCustomAnswerIntoPrompt", () => {
     expect(carryDisplacedCustomAnswerIntoPrompt("first half\n", "second half")).toBe(
       "first half\n\nsecond half",
     );
-  });
-});
-
-describe("withdrawDisplacedCustomAnswerFromPrompt", () => {
-  // regression: #35205 an answer restored with undo stayed in the thread draft and was sent twice
-  it("takes set-aside text back out of the thread draft and leaves the rest", () => {
-    const setAside = carryDisplacedCustomAnswerIntoPrompt("", "first answer ");
-    expect(withdrawDisplacedCustomAnswerFromPrompt(setAside, "first answer ")).toBe("");
-
-    const afterDraft = carryDisplacedCustomAnswerIntoPrompt("draft", "first answer");
-    expect(withdrawDisplacedCustomAnswerFromPrompt(afterDraft, "first answer")).toBe("draft");
-
-    const beforeSecond = carryDisplacedCustomAnswerIntoPrompt(setAside, "second answer");
-    expect(
-      withdrawDisplacedCustomAnswerFromPrompt(beforeSecond, "first answer", ["second answer"]),
-    ).toBe("second answer");
-
-    const between = carryDisplacedCustomAnswerIntoPrompt(afterDraft, "second answer");
-    expect(
-      withdrawDisplacedCustomAnswerFromPrompt(between, "first answer", ["second answer"]),
-    ).toBe("draft\n\nsecond answer");
-  });
-
-  it("removes its own copy, not equal text inside a later set-aside answer", () => {
-    const first = carryDisplacedCustomAnswerIntoPrompt("", "foo");
-    const both = carryDisplacedCustomAnswerIntoPrompt(first, "bar\n\nfoo");
-    expect(withdrawDisplacedCustomAnswerFromPrompt(both, "foo", ["bar\n\nfoo"])).toBe("bar\n\nfoo");
-  });
-
-  it("leaves a thread draft that no longer holds the set-aside text where it was put", () => {
-    expect(withdrawDisplacedCustomAnswerFromPrompt("first answer, edited", "first answer")).toBe(
-      "first answer, edited",
-    );
-    expect(withdrawDisplacedCustomAnswerFromPrompt("my first answer", "first answer")).toBe(
-      "my first answer",
-    );
-    expect(withdrawDisplacedCustomAnswerFromPrompt("draft", "  ")).toBe("draft");
   });
 });

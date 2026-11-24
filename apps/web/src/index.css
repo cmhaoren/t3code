@@ -2485,6 +2485,29 @@ code {
   }
 }
 
+/* A newly shown pending question eases in so switching cards does not read as a
+   hard cut. Keeping it short avoids delaying the option the user is reaching for. */
+@keyframes pending-question-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.pending-question-enter {
+  animation: pending-question-enter 170ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pending-question-enter {
+    animation: none;
+  }
+}
+
 /* Rich text composer (Tiptap). The stored prompt stays markdown; only the
    surface renders styled text. Markers (** * ` ~~) appear as non-editable
    widgets while the caret is on styled text. */

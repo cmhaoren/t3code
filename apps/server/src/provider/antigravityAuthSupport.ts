@@ -199,6 +199,13 @@ function quoteBrowserArgument(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+/** Windows treats environment keys as case-insensitive, so a caller's alias still wins. */
+function environmentHasKey(environment: NodeJS.ProcessEnv, name: string): boolean {
+  return Object.entries(environment).some(
+    ([key, value]) => key.toUpperCase() === name && value !== undefined,
+  );
+}
+
 function antigravityEnvironment(
   profile: AntigravityProfile,
   baseEnv: NodeJS.ProcessEnv,
@@ -222,6 +229,12 @@ function antigravityEnvironment(
   return {
     ...environment,
     ...credential,
+    // A tool shell cannot answer a credential prompt, so fail fast instead of hanging the turn.
+    ...(environmentHasKey(environment, "GIT_TERMINAL_PROMPT") ? {} : { GIT_TERMINAL_PROMPT: "0" }),
+    ...(environmentHasKey(environment, "GCM_INTERACTIVE") ? {} : { GCM_INTERACTIVE: "never" }),
+    ...(environmentHasKey(environment, "SSH_ASKPASS_REQUIRE")
+      ? {}
+      : { SSH_ASKPASS_REQUIRE: "never" }),
     ...(profile.caBundlePath !== undefined &&
     baseEnv.SSL_CERT_FILE === undefined &&
     baseEnv.SSL_CERT_DIR === undefined

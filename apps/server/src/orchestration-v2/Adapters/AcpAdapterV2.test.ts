@@ -94,6 +94,7 @@ import {
   type AcpAdapterV2RuntimeInput,
   type AcpAdapterV2SubagentUpdate,
 } from "@t3tools/provider-acp/server/adapter";
+import type { AcpToolCallState } from "@t3tools/provider-acp/server/runtimeModel";
 
 import { appendUserInputAttachmentPaths } from "../../provider/userInputAttachments.ts";
 
@@ -715,6 +716,112 @@ const makePromptInactivityHarness = Effect.fnUntraced(function* (input: {
             return event;
           }),
         ),
+      ),
+  };
+});
+
+const isNonDaemonExecuteTool = (toolCall: AcpToolCallState): boolean =>
+  toolCall.kind === "execute" &&
+  !(
+    typeof toolCall.data.rawInput === "object" &&
+    toolCall.data.rawInput !== null &&
+    Reflect.get(toolCall.data.rawInput, "IsDaemon") === true
+  );
+
+type StallPrompt = {
+  readonly text: string;
+  readonly gate: Deferred.Deferred<EffectAcpSchema.PromptResponse>;
+};
+
+const makeBackgroundCommandStallHarness = Effect.fnUntraced(function* (input: {
+  readonly isWatchableTool?: (toolCall: AcpToolCallState) => boolean;
+  readonly maxNudges?: number;
+}) {
+  const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const natives: Array<AcpSessionRuntime.AcpSessionRuntime["Service"]> = [];
+  const promptEvents = yield* Queue.unbounded<StallPrompt>();
+  const promptSettled = yield* Queue.unbounded<void>();
+  const instanceId = ProviderInstanceId.make("acp-background-stall");
+  const adapter = yield* makeAcpAdapterV2({
+    instanceId,
+    testHooks: {
+      afterPromptSettledWithBackgroundWork: () =>
+        Queue.offer(promptSettled, undefined).pipe(Effect.asVoid),
+    },
+    flavor: {
+      driver: ACP_TEST_DRIVER,
+      capabilities: AcpProviderCapabilitiesV2,
+      deferFinalizeForBackgroundWork: true,
+      steersWithPrompt: () => true,
+      toolOutlivesPrompt: isNonDaemonExecuteTool,
+      backgroundCommandStallNudge: {
+        after: "5 minutes",
+        maxNudges: input.maxNudges ?? 2,
+        isWatchableTool: input.isWatchableTool ?? isNonDaemonExecuteTool,
+      },
+      makeRuntime: makeMockRuntime({
+        childProcessSpawner,
+        mockAgentPath: yield* bundledMockAgentPath,
+        environment: {},
+        wrapRuntime: (runtime) => {
+          natives.push(runtime);
+          return {
+            ...runtime,
+            prompt: (payload, promptOptions) =>
+              Effect.gen(function* () {
+                // Hold the wire prompt so the test can settle it after a tool starts.
+                const gate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+                const text = payload.prompt
+                  .flatMap((block) => (block.type === "text" ? [block.text] : []))
+                  .join("\n");
+                yield* Queue.offer(promptEvents, { text, gate });
+                if (promptOptions?.dispatched !== undefined) {
+                  yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                }
+                return yield* Deferred.await(gate);
+              }),
+          };
+        },
+      }),
+    },
+    selfInvocation: yield* resolveSelfInvocation(),
+  });
+  const threadId = ThreadId.make("thread-acp-background-stall");
+  const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    cwd: process.cwd(),
+  });
+  const modelSelection = { instanceId, model: "default" } as const;
+  const runtime = yield* adapter.openSession({
+    threadId,
+    providerSessionId: ProviderSessionId.make("provider-session-acp-background-stall"),
+    modelSelection,
+    runtimePolicy,
+  });
+  const providerThread = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+  return {
+    promptEvents,
+    promptSettled,
+    startTurn: (ordinal: number) =>
+      DateTime.now.pipe(
+        Effect.flatMap((now) =>
+          runtime.startTurn(
+            makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal }),
+          ),
+        ),
+      ),
+    emitUpdate: (update: EffectAcpSchema.SessionUpdate) =>
+      natives.at(-1)!.request("_test/emit-update", { sessionId: "mock-session-1", update }),
+    toolRunning: (toolCallId: string) =>
+      runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === toolCallId &&
+            event.turnItem.status === "running",
+        ),
+        Stream.runHead,
       ),
   };
 });
@@ -5762,6 +5869,123 @@ describe("AcpAdapterV2", () => {
         assert.equal(silent?.status, "failed");
         assert.equal(next?.status, "completed");
       }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "steers one reminder when a background command stays silent past the stall timeout",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeBackgroundCommandStallHarness({});
+        yield* harness.startTurn(1);
+        const turnPrompt = yield* Queue.take(harness.promptEvents);
+        yield* harness.emitUpdate({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "stalled-command",
+          title: "git push",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { command: "git push" },
+        });
+        yield* harness.toolRunning("stalled-command");
+        yield* Deferred.succeed(turnPrompt.gate, { stopReason: "end_turn" });
+        yield* Queue.take(harness.promptSettled);
+
+        yield* TestClock.adjust(Duration.millis(299_000));
+        assert.equal(yield* Queue.size(harness.promptEvents), 0);
+        yield* TestClock.adjust("1 second");
+        const nudge = yield* Queue.take(harness.promptEvents);
+        assert.include(nudge.text, "[System Watchdog]");
+        assert.include(nudge.text, "Ran command");
+        assert.include(nudge.text, "5 minutes");
+        yield* Deferred.succeed(nudge.gate, { stopReason: "end_turn" });
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("a tool update before the stall timeout restarts the countdown", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeBackgroundCommandStallHarness({});
+      yield* harness.startTurn(1);
+      const turnPrompt = yield* Queue.take(harness.promptEvents);
+      yield* harness.emitUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "stalled-command",
+        title: "git push",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { command: "git push" },
+      });
+      yield* harness.toolRunning("stalled-command");
+      yield* Deferred.succeed(turnPrompt.gate, { stopReason: "end_turn" });
+      yield* Queue.take(harness.promptSettled);
+
+      yield* TestClock.adjust("3 minutes");
+      yield* harness.emitUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "progress-command",
+        title: "git status",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { command: "git status" },
+      });
+      yield* harness.toolRunning("progress-command");
+
+      yield* TestClock.adjust(Duration.millis(299_000));
+      assert.equal(yield* Queue.size(harness.promptEvents), 0);
+      yield* TestClock.adjust("1 second");
+      const nudge = yield* Queue.take(harness.promptEvents);
+      assert.include(nudge.text, "[System Watchdog]");
+      yield* Deferred.succeed(nudge.gate, { stopReason: "end_turn" });
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("does not nudge a running tool the flavor cannot watch", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeBackgroundCommandStallHarness({ isWatchableTool: () => false });
+      yield* harness.startTurn(1);
+      const turnPrompt = yield* Queue.take(harness.promptEvents);
+      yield* harness.emitUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "unwatched-command",
+        title: "vp run dev",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { command: "vp run dev" },
+      });
+      yield* harness.toolRunning("unwatched-command");
+      yield* Deferred.succeed(turnPrompt.gate, { stopReason: "end_turn" });
+      yield* Queue.take(harness.promptSettled);
+
+      yield* TestClock.adjust("10 minutes");
+      assert.equal(yield* Queue.size(harness.promptEvents), 0);
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("caps background stall reminders at maxNudges", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeBackgroundCommandStallHarness({ maxNudges: 1 });
+      yield* harness.startTurn(1);
+      const turnPrompt = yield* Queue.take(harness.promptEvents);
+      yield* harness.emitUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "stalled-command",
+        title: "git push",
+        kind: "execute",
+        status: "in_progress",
+        rawInput: { command: "git push" },
+      });
+      yield* harness.toolRunning("stalled-command");
+      yield* Deferred.succeed(turnPrompt.gate, { stopReason: "end_turn" });
+      yield* Queue.take(harness.promptSettled);
+
+      yield* TestClock.adjust("5 minutes");
+      const nudge = yield* Queue.take(harness.promptEvents);
+      assert.include(nudge.text, "[System Watchdog]");
+      yield* Deferred.succeed(nudge.gate, { stopReason: "end_turn" });
+      yield* Queue.take(harness.promptSettled);
+
+      yield* TestClock.adjust("10 minutes");
+      assert.equal(yield* Queue.size(harness.promptEvents), 0);
+    }).pipe(Effect.provide(layerTest)),
   );
 
   it.effect("delivers a follow-up the agent rejects while it is still processing", () =>

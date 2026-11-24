@@ -99,6 +99,9 @@ describe("Antigravity process environment", () => {
         HOME: "/home/developer",
         PATH: "/usr/bin",
         CUSTOM_SETTING: "keep-this",
+        GIT_TERMINAL_PROMPT: "0",
+        GCM_INTERACTIVE: "never",
+        SSH_ASKPASS_REQUIRE: "never",
         SSH_CONNECTION: "127.0.0.1 0 127.0.0.1 0",
         GEMINI_HOME: profile.geminiHome,
         AGY_ACP_FORCE_FILE_STORAGE: "1",
@@ -109,6 +112,33 @@ describe("Antigravity process environment", () => {
         TMPDIR: profile.tempDirectory,
       },
     });
+  });
+
+  it("defaults non-interactive Git and SSH prompts unless the caller overrides them", () => {
+    const spawnFor = (baseEnv: NodeJS.ProcessEnv) =>
+      buildAntigravityAcpSpawnInput({
+        installation: { executablePath: "/usr/bin/agy" },
+        profile,
+        cwd: "/project",
+        baseEnv,
+      }).env ?? {};
+
+    const defaults = spawnFor({ PATH: "/usr/bin" });
+    expect(defaults.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(defaults.GCM_INTERACTIVE).toBe("never");
+    expect(defaults.SSH_ASKPASS_REQUIRE).toBe("never");
+
+    // A caller's value wins, including a lower-case alias on a case-insensitive platform.
+    const overridden = spawnFor({
+      GIT_TERMINAL_PROMPT: "1",
+      gcm_interactive: "always",
+      ssh_askpass_require: "force",
+    });
+    expect(overridden.GIT_TERMINAL_PROMPT).toBe("1");
+    expect(overridden.gcm_interactive).toBe("always");
+    expect(overridden.ssh_askpass_require).toBe("force");
+    expect(overridden.GCM_INTERACTIVE).toBeUndefined();
+    expect(overridden.SSH_ASKPASS_REQUIRE).toBeUndefined();
   });
 
   it("passes only the configured method's credential and keeps the GCP pair out of the environment", () => {

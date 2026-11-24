@@ -212,6 +212,12 @@ const ACP_PROMPT_ACTIVITY_UPDATES: ReadonlySet<string> = new Set([
   "compaction_summary_chunk",
 ]);
 
+interface AcpBackgroundCommandStallConfig {
+  readonly afterMillis: number;
+  readonly maxNudges: number;
+  readonly isWatchableTool: (toolCall: AcpToolCallState) => boolean;
+}
+
 export interface AcpAdapterV2RuntimeInput {
   readonly cwd: string;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
@@ -691,6 +697,16 @@ export interface AcpAdapterV2Flavor {
    * agent request, tool or subagent is open, and replaces the agent before the next turn.
    */
   readonly promptInactivityTimeout?: Duration.Input;
+  /**
+   * After a prompt settles with `deferredBackgroundWork` still running, steers one wake
+   * reminder if watchable background tools remain silent for `after` (for example a hung
+   * prompt or stalled shell command). Respects host sleep and open user requests.
+   */
+  readonly backgroundCommandStallNudge?: {
+    readonly after: Duration.Input;
+    readonly maxNudges?: number;
+    readonly isWatchableTool: (toolCall: AcpToolCallState) => boolean;
+  };
   /** Grok can retain task_already_running until process exit. */
   readonly restartRuntimeAfterInterrupt?: boolean;
   /** Prompt failures after which the agent process keeps failing until replaced. */
@@ -1758,6 +1774,9 @@ interface ActiveAcpTurn {
   /** Clock millis of the prompt's last progress, for `promptInactivityTimeout`. */
   lastProgressAt: number;
   inactivityWatchdog: Fiber.Fiber<void> | undefined;
+  /** Post-settle watcher for stalled background commands, for `backgroundCommandStallNudge`. */
+  backgroundStallWatchdog: Fiber.Fiber<void> | undefined;
+  backgroundStallNudgeCount: number;
 }
 
 type AcpRuntimeTeardownState =
@@ -2741,13 +2760,25 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           flavor.promptInactivityTimeout === undefined
             ? undefined
             : Duration.toMillis(flavor.promptInactivityTimeout);
+        const backgroundCommandStallConfig: AcpBackgroundCommandStallConfig | undefined =
+          flavor.backgroundCommandStallNudge === undefined
+            ? undefined
+            : {
+                afterMillis: Duration.toMillis(flavor.backgroundCommandStallNudge.after),
+                maxNudges: flavor.backgroundCommandStallNudge.maxNudges ?? 2,
+                isWatchableTool: flavor.backgroundCommandStallNudge.isWatchableTool,
+              };
         // Each runtime owns its unanswered agent requests, so a dead process's leftovers
         // and late callbacks never reach its replacement.
         let openAgentRequests = new Set<string>();
         const notePromptProgress =
           /* Provider events include streaming deltas; avoid a span for each update. */
           Effect.fnUntraced(function* (notification?: EffectAcpSchema.SessionNotification) {
-            if (promptInactivityTimeoutMillis === undefined) return;
+            if (
+              promptInactivityTimeoutMillis === undefined &&
+              backgroundCommandStallConfig === undefined
+            )
+              return;
             if (
               notification !== undefined &&
               !ACP_PROMPT_ACTIVITY_UPDATES.has(notification.update.sessionUpdate)
@@ -8597,6 +8628,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (watchdog !== undefined) {
             yield* Fiber.interrupt(watchdog).pipe(Effect.forkDetach, Effect.asVoid);
           }
+          const backgroundStallWatchdog = context.backgroundStallWatchdog;
+          context.backgroundStallWatchdog = undefined;
+          if (backgroundStallWatchdog !== undefined) {
+            yield* Fiber.interrupt(backgroundStallWatchdog).pipe(Effect.forkDetach, Effect.asVoid);
+          }
           const directStopQuarantine = yield* Ref.get(stoppedRunQuarantine);
           if (flavor.subagentsIdleOnTurnCompletion === true) {
             for (const subagent of context.subagents.values()) {
@@ -8931,6 +8967,114 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             if (outcome !== "rearm") return;
           }
         });
+
+        /**
+         * A settled prompt can leave a shell command waiting for input forever. Steer one
+         * reminder after it stays silent, then let the turn's own prompt settle again.
+         */
+        const nudgeStalledBackgroundCommand = Effect.fn(
+          "AcpAdapterV2.nudgeStalledBackgroundCommand",
+        )(function* (
+          context: ActiveAcpTurn,
+          generation: number,
+          stallConfig: AcpBackgroundCommandStallConfig,
+        ) {
+          const outcome = yield* runRuntimeCallbackAtGeneration(
+            generation,
+            Effect.gen(function* () {
+              if (context.finalized || context.interrupted) return "done" as const;
+              if ((yield* Ref.get(activeTurn)) !== context) return "done" as const;
+              if (!context.promptSettled) return "done" as const;
+              if (!hasDeferredBackgroundWork(context)) return "done" as const;
+              if (context.backgroundStallNudgeCount >= stallConfig.maxNudges)
+                return "done" as const;
+              const now = yield* Clock.currentTimeMillis;
+              if (context.lastProgressAt + stallConfig.afterMillis > now) return "rearm" as const;
+              // A user request or a reporting subagent is progress, not a stall.
+              if (
+                openAgentRequests.size > 0 ||
+                (yield* Ref.get(pendingRuntimeRequests)).size > 0 ||
+                [...context.subagents.values()].some((subagent) =>
+                  acpSubagentStatusBlocksTurnSettlement(subagent.task.status),
+                )
+              ) {
+                context.lastProgressAt = now;
+                return "rearm" as const;
+              }
+              const stalledTools = [...context.tools.values()].filter(
+                (tool) =>
+                  toolStatus(tool.status) === "running" && stallConfig.isWatchableTool(tool),
+              );
+              if (stalledTools.length === 0) return "done" as const;
+              context.backgroundStallNudgeCount += 1;
+              context.backgroundStallWatchdog = undefined;
+              const minutes = Math.max(1, Math.round(stallConfig.afterMillis / 60_000));
+              const titles = stalledTools
+                .map((tool) => tool.title || tool.toolCallId)
+                .slice(0, 3)
+                .join(", ");
+              yield* Effect.logWarning("orchestration-v2.acp-background-command-stall-nudge", {
+                driver,
+                providerSessionId: input.providerSessionId,
+                providerTurnId: context.providerTurnId,
+                nudgeCount: context.backgroundStallNudgeCount,
+                tools: titles,
+                afterMillis: stallConfig.afterMillis,
+              });
+              yield* steerWithPrompt({
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                providerThread: context.input.providerThread,
+                providerTurnId: context.providerTurnId,
+                message: {
+                  messageId: idAllocator.derive.messageFromProviderItem({
+                    driver,
+                    nativeItemId: `${context.nativeTurnId}:background-command-stall:${context.backgroundStallNudgeCount}`,
+                  }),
+                  text:
+                    `[System Watchdog] Background command(s) (${titles}) have had no output or status change for ${minutes} ${minutes === 1 ? "minute" : "minutes"}. ` +
+                    "Please inspect status/output with manage_task (or process status) right away; " +
+                    "if stalled or waiting on input, cancel and switch to non-interactive flags/timeouts. " +
+                    "If still legitimately working, set a NotificationTimeoutSeconds timer and report progress.",
+                  attachments: [],
+                  createdBy: "system",
+                  creationSource: "server",
+                },
+              }).pipe(Effect.ignoreCause, Effect.forkIn(sessionScope));
+              return "done" as const;
+            }),
+          );
+          return Option.getOrElse(outcome, () => "done" as const);
+        });
+
+        const watchBackgroundCommandStall = Effect.fn("AcpAdapterV2.watchBackgroundCommandStall")(
+          function* (
+            context: ActiveAcpTurn,
+            generation: number,
+            stallConfig: AcpBackgroundCommandStallConfig,
+          ) {
+            while (true) {
+              const sliceStartedAt = yield* Clock.currentTimeMillis;
+              const remaining = context.lastProgressAt + stallConfig.afterMillis - sliceStartedAt;
+              if (remaining > 0) {
+                const slice = Math.min(remaining, ACP_PROMPT_INACTIVITY_SLICE_MILLIS);
+                yield* Effect.sleep(Duration.millis(slice));
+                // Host sleep is not a stalled command. Timers either fire late on wake or pause
+                // while the wall clock jumps, so both overrun a short slice.
+                const now = yield* Clock.currentTimeMillis;
+                if (now - sliceStartedAt > slice + ACP_HOST_SLEEP_TOLERANCE_MILLIS) {
+                  context.lastProgressAt = now;
+                }
+                continue;
+              }
+              const outcome = yield* runtimeTransitionPermit.withPermit(
+                nudgeStalledBackgroundCommand(context, generation, stallConfig),
+              );
+              if (outcome !== "rearm") return;
+              if (context.finalized || context.interrupted) return;
+            }
+          },
+        );
 
         const imageAttachmentBlocks = Effect.fnUntraced(function* (
           attachments: ReadonlyArray<ChatAttachment>,
@@ -9268,6 +9412,34 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       context.replyOpen = true;
                       yield* scheduleDeferredFinalize(context);
                     }
+                    if (
+                      deferredBackgroundWork &&
+                      backgroundCommandStallConfig !== undefined &&
+                      steersWithPrompt &&
+                      context.backgroundStallNudgeCount < backgroundCommandStallConfig.maxNudges &&
+                      [...context.tools.values()].some(
+                        (tool) =>
+                          toolStatus(tool.status) === "running" &&
+                          backgroundCommandStallConfig.isWatchableTool(tool),
+                      )
+                    ) {
+                      // Count silence from settlement so a long foreground prompt does not
+                      // immediately look like a stalled background command.
+                      context.lastProgressAt = yield* Clock.currentTimeMillis;
+                      const previousWatchdog = context.backgroundStallWatchdog;
+                      context.backgroundStallWatchdog = undefined;
+                      if (previousWatchdog !== undefined) {
+                        yield* Fiber.interrupt(previousWatchdog).pipe(
+                          Effect.forkDetach,
+                          Effect.asVoid,
+                        );
+                      }
+                      context.backgroundStallWatchdog = yield* watchBackgroundCommandStall(
+                        context,
+                        settle.generation,
+                        backgroundCommandStallConfig,
+                      ).pipe(Effect.forkIn(sessionScope));
+                    }
                     yield* (
                       options.testHooks?.afterPromptSettledWithBackgroundWork?.() ?? Effect.void
                     );
@@ -9527,6 +9699,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               nativePromptId: undefined,
               lastProgressAt: 0,
               inactivityWatchdog: undefined,
+              backgroundStallWatchdog: undefined,
+              backgroundStallNudgeCount: 0,
             };
             const carryover = yield* Ref.getAndSet(carryoverSubagents, null);
             let rehydratedCarryoverSubagents: ReadonlyArray<ActiveAcpSubagent> = [];
@@ -9806,6 +9980,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   context.inactivityWatchdog = undefined;
                   if (watchdog !== undefined) {
                     yield* Fiber.interrupt(watchdog).pipe(Effect.forkDetach, Effect.asVoid);
+                  }
+                  const backgroundStallWatchdog = context.backgroundStallWatchdog;
+                  context.backgroundStallWatchdog = undefined;
+                  if (backgroundStallWatchdog !== undefined) {
+                    yield* Fiber.interrupt(backgroundStallWatchdog).pipe(
+                      Effect.forkDetach,
+                      Effect.asVoid,
+                    );
                   }
                   if (promptInactivityTimeoutMillis !== undefined) {
                     context.inactivityWatchdog = yield* watchPromptInactivity(
