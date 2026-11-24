@@ -400,14 +400,24 @@ export function UsageLimitsSection({
 }) {
   const presentations = useAtomValue(environmentPresentations.presentationsWithProvidersAtom);
   const hiddenDrivers = new Set<ServerProvider["driver"]>(
-    [...hiddenProviders].map((provider) => PROVIDER_PRESENTATION[provider].driverKind),
+    [...hiddenProviders]
+      .filter((provider) => PROVIDER_PRESENTATION[provider].driverKind !== "acpRegistry")
+      .map((provider) => PROVIDER_PRESENTATION[provider].driverKind),
   );
-  const isVisible = (driver: ServerProvider["driver"]) => !hiddenDrivers.has(driver);
+  const hideDsh = hiddenProviders.has("dsh");
+  const isVisible = (driver: ServerProvider["driver"], groupId: string | undefined): boolean => {
+    if (driver === "acpRegistry") {
+      return !(hideDsh && groupId === "acpRegistry:deepseek-harness");
+    }
+    return !hiddenDrivers.has(driver);
+  };
   const selected = new Map(
     [...presentations].flatMap(([id, presentation]) => {
       if (selectedEnvironmentIds !== null && !selectedEnvironmentIds.has(id)) return [];
       const config = presentation.serverConfig;
-      if (hiddenDrivers.size === 0 || config === null) return [[id, presentation] as const];
+      if ((hiddenDrivers.size === 0 && !hideDsh) || config === null) {
+        return [[id, presentation] as const];
+      }
       return [
         [
           id,
@@ -415,9 +425,13 @@ export function UsageLimitsSection({
             ...presentation,
             serverConfig: {
               ...config,
-              providers: config.providers.filter((provider) => isVisible(provider.driver)),
+              providers: config.providers.filter((provider) =>
+                isVisible(provider.driver, provider.usageLimits?.group?.id),
+              ),
               usageLimitSources: config.usageLimitSources?.flatMap((source) => {
-                const accounts = source.accounts.filter((account) => isVisible(account.driver));
+                const accounts = source.accounts.filter((account) =>
+                  isVisible(account.driver, account.usageLimits.group?.id),
+                );
                 return accounts.length === 0 && source.accounts.length > 0
                   ? []
                   : [{ ...source, accounts }];

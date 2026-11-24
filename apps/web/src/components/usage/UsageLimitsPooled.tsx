@@ -75,6 +75,12 @@ function AccountChip({ email }: { readonly email: string }) {
   );
 }
 
+function acpRegistryAgentIdForLimitGroup(groupId: string | undefined): string | undefined {
+  if (!groupId?.startsWith("acpRegistry:")) return undefined;
+  const agentId = groupId.slice("acpRegistry:".length).trim();
+  return agentId.length > 0 ? agentId : undefined;
+}
+
 function AccountAvatar({
   account,
   className,
@@ -92,6 +98,7 @@ function AccountAvatar({
           providerClients.get(account.driver)?.label ??
           String(account.driver)
         }
+        acpRegistryAgentId={acpRegistryAgentIdForLimitGroup(account.limits.group?.id)}
         acpRegistryIconUrl={account.iconUrl}
         accentColor={account.accentColor}
         showBadge={Boolean(account.displayName)}
@@ -693,6 +700,7 @@ function PoolSection({ pool, now }: { readonly pool: LimitPool; readonly now: nu
           <ProviderInstanceIcon
             driverKind={pool.driver}
             displayName={label}
+            acpRegistryAgentId={acpRegistryAgentIdForLimitGroup(pool.id)}
             acpRegistryIconUrl={pool.iconUrl}
             indicatorBackground="var(--background)"
             className="size-4 shrink-0"
