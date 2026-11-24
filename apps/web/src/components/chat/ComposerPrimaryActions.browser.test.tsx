@@ -295,3 +295,127 @@ it("keeps the last question's submit disabled when only that question is unanswe
     .element(screen.getByRole("button", { name: "Submit answers", exact: true }))
     .toBeDisabled();
 });
+
+it("hides the Previous button in all-questions view", async () => {
+  const props = setup();
+  await using screen = await render(
+    <ComposerPrimaryActions
+      {...props}
+      compact={false}
+      pendingAction={{
+        questionIndex: 1,
+        questionCount: 3,
+        isLastQuestion: false,
+        allQuestionsView: true,
+        canAdvance: false,
+        isResponding: false,
+        isComplete: false,
+        answeredQuestionCount: 0,
+        firstUnansweredQuestionIndex: 0,
+      }}
+      onSelectPendingQuestionIndex={vi.fn()}
+    />,
+  );
+  expect(screen.getByRole("button", { name: "Previous", exact: true }).query()).toBeNull();
+});
+
+it("submits every answer directly from all-questions view", async () => {
+  const props = setup();
+  const onSubmitPendingAnswers = vi.fn();
+  const submit = vi.fn();
+  await using screen = await render(
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <ComposerPrimaryActions
+        {...props}
+        compact={false}
+        pendingAction={{
+          questionIndex: 0,
+          questionCount: 3,
+          isLastQuestion: false,
+          allQuestionsView: true,
+          canAdvance: false,
+          isResponding: false,
+          isComplete: true,
+          answeredQuestionCount: 3,
+          firstUnansweredQuestionIndex: null,
+        }}
+        onSubmitPendingAnswers={onSubmitPendingAnswers}
+      />
+    </form>,
+  );
+  const action = screen.getByRole("button", { name: "Submit answers", exact: true });
+  await expect.element(action).toBeEnabled();
+  await act(() => (action.element() as HTMLButtonElement).click());
+  expect(onSubmitPendingAnswers).toHaveBeenCalledTimes(1);
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("points the all-questions action at the first unanswered question", async () => {
+  const props = setup();
+  const onSelectPendingQuestionIndex = vi.fn();
+  const onSubmitPendingAnswers = vi.fn();
+  const submit = vi.fn();
+  await using screen = await render(
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <ComposerPrimaryActions
+        {...props}
+        compact={false}
+        pendingAction={{
+          questionIndex: 0,
+          questionCount: 3,
+          isLastQuestion: false,
+          allQuestionsView: true,
+          canAdvance: false,
+          isResponding: false,
+          isComplete: false,
+          answeredQuestionCount: 2,
+          firstUnansweredQuestionIndex: 2,
+        }}
+        onSelectPendingQuestionIndex={onSelectPendingQuestionIndex}
+        onSubmitPendingAnswers={onSubmitPendingAnswers}
+      />
+    </form>,
+  );
+  const jump = screen.getByRole("button", { name: "Go to question 3", exact: true });
+  await expect.element(jump).toBeEnabled();
+  await act(() => (jump.element() as HTMLButtonElement).click());
+  expect(onSelectPendingQuestionIndex).toHaveBeenCalledWith(2);
+  expect(onSubmitPendingAnswers).not.toHaveBeenCalled();
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("keeps the all-questions submit disabled while the current question is unanswered", async () => {
+  const props = setup();
+  await using screen = await render(
+    <ComposerPrimaryActions
+      {...props}
+      compact={false}
+      pendingAction={{
+        questionIndex: 0,
+        questionCount: 3,
+        isLastQuestion: false,
+        allQuestionsView: true,
+        canAdvance: false,
+        isResponding: false,
+        isComplete: false,
+        answeredQuestionCount: 2,
+        firstUnansweredQuestionIndex: 0,
+      }}
+      onSelectPendingQuestionIndex={vi.fn()}
+      onSubmitPendingAnswers={vi.fn()}
+    />,
+  );
+  await expect
+    .element(screen.getByRole("button", { name: "Submit answers", exact: true }))
+    .toBeDisabled();
+});

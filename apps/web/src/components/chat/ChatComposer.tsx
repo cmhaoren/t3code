@@ -221,7 +221,12 @@ import {
 } from "./ComposerAttachmentStrip";
 import { CollapsedComposerStopAction, ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
-import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
+import {
+  ComposerPendingUserInputPanel,
+  type PendingUserInputViewMode,
+  readPendingUserInputViewModePreference,
+  writePendingUserInputViewModePreference,
+} from "./ComposerPendingUserInputPanel";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
 import { buildPullRequestReferenceContext } from "../pullRequest/pullRequestDetail.logic";
 import { getComposerPromptInjectionState, getComposerReasoningStep } from "./composerProviderState";
@@ -485,6 +490,7 @@ export interface ChatComposerProps {
   onDismissActivePendingUserInput: (requestId: RuntimeRequestId) => void;
   onPreviousActivePendingUserInputQuestion: () => void;
   onSelectActivePendingUserInputQuestionIndex?: (questionIndex: number) => void;
+  onSubmitActivePendingUserInput?: (() => void) | undefined;
   onChangeActivePendingUserInputCustomAnswer: (
     questionId: string,
     value: string,
@@ -589,6 +595,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onDismissActivePendingUserInput,
     onPreviousActivePendingUserInputQuestion,
     onSelectActivePendingUserInputQuestionIndex,
+    onSubmitActivePendingUserInput,
     onChangeActivePendingUserInputCustomAnswer,
     onProviderModelSelect,
     onOpenProviderSetup,
@@ -1271,17 +1278,31 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     hiddenBlockCount: expandedControlsHiddenBlockCount,
     iconOnlyBlockCount: expandedControlsIconOnlyBlockCount,
   } = useRestingComposerControlsLayout(null, true);
+  const [pendingUserInputViewMode, setPendingUserInputViewMode] =
+    useState<PendingUserInputViewMode>(readPendingUserInputViewModePreference);
+  const handlePendingUserInputViewModeChange = useStableCallback(
+    (nextViewMode: PendingUserInputViewMode) => {
+      setPendingUserInputViewMode(nextViewMode);
+      writePendingUserInputViewModePreference(nextViewMode);
+    },
+  );
+  const isAllPendingQuestionsView =
+    (activePendingUserInput?.questions.length ?? 0) > 1 && pendingUserInputViewMode === "all";
   const pendingPrimaryAction = activePendingProgress
     ? {
         questionIndex: activePendingProgress.questionIndex,
         questionCount: activePendingUserInput?.questions.length ?? 0,
         isLastQuestion: activePendingProgress.isLastQuestion,
+        allQuestionsView: isAllPendingQuestionsView,
         canAdvance:
           activePendingProgress.canAdvance &&
           !attachmentBlockReason &&
           !(questionPreparations[attachmentTargetKey] ?? 0),
         isResponding: activePendingIsResponding,
-        isComplete: Boolean(activePendingResolvedAnswers),
+        isComplete:
+          Boolean(activePendingResolvedAnswers) &&
+          !attachmentBlockReason &&
+          !(questionPreparations[attachmentTargetKey] ?? 0),
         answeredQuestionCount: activePendingProgress.answeredQuestionCount,
         firstUnansweredQuestionIndex: activePendingProgress.firstUnansweredQuestionIndex,
       }
@@ -3643,6 +3664,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onAdvance={onAdvanceActivePendingUserInput}
                     onDismiss={onDismissActivePendingUserInput}
                     onSelectQuestionIndex={onSelectActivePendingUserInputQuestionIndex}
+                    viewMode={pendingUserInputViewMode}
+                    onViewModeChange={handlePendingUserInputViewModeChange}
                   />
                 ) : null}
               </ComposerBanner.Root>
@@ -3946,6 +3969,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                       onNextPendingQuestion={onNextPendingQuestion}
                       onSelectPendingQuestionIndex={onSelectActivePendingUserInputQuestionIndex}
+                      onSubmitPendingAnswers={onSubmitActivePendingUserInput}
                       onInterrupt={handleInterruptPrimaryActionStable}
                     />
                   </div>
@@ -4044,6 +4068,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                     onNextPendingQuestion={onNextPendingQuestion}
                     onSelectPendingQuestionIndex={onSelectActivePendingUserInputQuestionIndex}
+                    onSubmitPendingAnswers={onSubmitActivePendingUserInput}
                     onInterrupt={handleInterruptPrimaryActionStable}
                     compactBeforeSendTokens={props.resumeCompactionTokens}
                     hideCompactToggle={dictationTakesFooter}

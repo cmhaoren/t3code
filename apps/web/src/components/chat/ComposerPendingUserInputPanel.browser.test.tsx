@@ -198,9 +198,13 @@ it.each<{ focus: string; control: ReactNode; toggles: boolean }>([
   },
 );
 
-it("moves freely between unanswered questions with the arrows and tabs", async () => {
+it("navigates linearly between questions with the header arrows and no stepper", async () => {
   using _preferences = cleanPendingUserInputPreferences();
   await using screen = await render(<NavigablePanel />);
+
+  // The horizontal stepper is gone; navigation lives in the header row only.
+  expect(screen.container.querySelector("[data-pending-user-input-stepper]")).toBeNull();
+  expect(screen.container.querySelectorAll("[data-pending-question-tab]")).toHaveLength(0);
 
   const previous = screen.getByRole("button", { name: "Previous question" });
   const next = screen.getByRole("button", { name: "Next question" });
@@ -212,32 +216,19 @@ it("moves freely between unanswered questions with the arrows and tabs", async (
 
   await next.click();
   await expect.element(screen.getByText("Choose for the third question")).toBeVisible();
-  expect(screen.getByTitle("Third").element().getAttribute("aria-current")).toBe("step");
+  expect(next.element().hasAttribute("disabled")).toBe(true);
 
   await previous.click();
   await expect.element(screen.getByText("Choose for the second question")).toBeVisible();
 
-  await screen.getByTitle("Third").click();
-  await expect.element(screen.getByText("Choose for the third question")).toBeVisible();
-});
+  await previous.click();
+  await expect.element(screen.getByText("Choose for the first question")).toBeVisible();
 
-it("marks answered questions on the stepper and jumps to any tab", async () => {
-  using _preferences = cleanPendingUserInputPreferences();
-  await using screen = await render(<NavigablePanel />);
-
-  const tabs = screen.container.querySelectorAll<HTMLButtonElement>("[data-pending-question-tab]");
-  expect(tabs).toHaveLength(3);
-  expect(tabs[0]?.querySelector("svg")).toBeNull();
-
-  await userEvent.click(screen.getByText("Alpha"));
-
-  expect(tabs[0]?.querySelector("svg")).not.toBeNull();
-  expect(tabs[1]?.querySelector("svg")).toBeNull();
-  expect(tabs[1]?.textContent).toContain("2");
-
-  await screen.getByTitle("Third").click();
-  await expect.element(screen.getByText("Choose for the third question")).toBeVisible();
-  expect(tabs[2]?.getAttribute("aria-current")).toBe("step");
+  // Answering keeps the single view on the question the user is reading.
+  await screen.getByRole("button", { name: "Next question" }).click();
+  await userEvent.click(screen.getByText("Beta"));
+  await expect.element(screen.getByText("1/3 answered")).toBeVisible();
+  await expect.element(screen.getByText("Choose for the second question")).toBeVisible();
 });
 
 it("shows every question at once, answers a card, and does not auto-advance", async () => {
@@ -249,6 +240,10 @@ it("shows every question at once, answers a card, and does not auto-advance", as
   );
 
   await screen.getByTitle("View all questions together").click();
+
+  expect(screen.container.querySelector("[data-pending-user-input-prev]")).toBeNull();
+  expect(screen.container.querySelector("[data-pending-user-input-next]")).toBeNull();
+  await expect.element(screen.getByText("All questions", { exact: true })).toBeVisible();
 
   const firstCard = screen.container.querySelector('[data-pending-question-card="0"]');
   const secondCard = screen.container.querySelector('[data-pending-question-card="1"]');
@@ -264,6 +259,7 @@ it("shows every question at once, answers a card, and does not auto-advance", as
       .querySelector('[data-pending-question-card="1"]')
       ?.getAttribute("data-pending-question-active"),
   ).toBe("true");
+  await expect.element(screen.getByText("1/3 answered")).toBeVisible();
 
   // "All" mode must not schedule the single-view auto-advance timer at all.
   const setTimeoutSpy = vi.spyOn(window, "setTimeout");
@@ -274,6 +270,116 @@ it("shows every question at once, answers a card, and does not auto-advance", as
     setTimeoutSpy.mockRestore();
   }
   expect(onAdvance).not.toHaveBeenCalled();
+
+  // The height preference works in all-questions view too.
+  const heightToggle = () =>
+    screen.container.querySelector<HTMLElement>("[data-pending-user-input-height]");
+  expect(heightToggle()?.getAttribute("data-pending-user-input-height")).toBe("default");
+  await screen.getByTitle("Expand question panel height").click();
+  expect(heightToggle()?.getAttribute("data-pending-user-input-height")).toBe("expanded");
+});
+
+it("unwraps a provider's generic elicitation question into a numbered header", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const genericPrompt: PendingUserInput = {
+    requestId: RuntimeRequestId.make("question-generic"),
+    createdAt: "2026-10-31T00:00:00.000Z",
+    dismissible: false,
+    responseCapability: "live",
+    questions: [
+      {
+        id: "generic-0",
+        header: "How should this ship?",
+        question: "The agent has 2 questions.",
+        options: [{ label: "Incremental", description: "One module at a time" }],
+        multiSelect: false,
+      },
+      {
+        id: "generic-1",
+        header: "Which module goes first?",
+        question: "The agent has 2 questions.",
+        options: [{ label: "Auth", description: "Sign-in first" }],
+        multiSelect: false,
+      },
+    ],
+  };
+  await using screen = await render(
+    <ComposerPendingUserInputPanel
+      pendingUserInputs={[genericPrompt]}
+      cwd={undefined}
+      threadRef={threadRef}
+      respondingRequestIds={[]}
+      answers={{}}
+      questionIndex={0}
+      onToggleOption={vi.fn()}
+      onAdvance={vi.fn()}
+      onDismiss={vi.fn()}
+      onSelectQuestionIndex={vi.fn()}
+    />,
+  );
+
+  // The header is numbered and the real question moves into the body, untruncated.
+  await expect.element(screen.getByText("Question 1", { exact: true })).toBeVisible();
+  await expect.element(screen.getByText("How should this ship?", { exact: true })).toBeVisible();
+  expect(screen.container.textContent).not.toContain("The agent has 2 questions.");
+});
+
+it("renders a (Recommended) marker as a badge without changing the option value", async () => {
+  using _preferences = cleanPendingUserInputPreferences();
+  const onToggleOption = vi.fn();
+  const recommendedPrompt: PendingUserInput = {
+    requestId: RuntimeRequestId.make("question-recommended"),
+    createdAt: "2026-10-31T00:00:00.000Z",
+    dismissible: false,
+    responseCapability: "live",
+    questions: [
+      {
+        id: "recommended-question",
+        header: "Release",
+        question: "Which channel should this ship on?",
+        options: [
+          {
+            label: "(Recommended) Stable",
+            description: "Stable (Recommended)",
+            value: "stable-channel",
+          },
+          { label: "Beta (Recommended)", description: "Beta (Recommended)" },
+        ],
+        multiSelect: false,
+      },
+    ],
+  };
+  await using screen = await render(
+    <ComposerPendingUserInputPanel
+      pendingUserInputs={[recommendedPrompt]}
+      cwd={undefined}
+      threadRef={threadRef}
+      respondingRequestIds={[]}
+      answers={{}}
+      questionIndex={0}
+      onToggleOption={onToggleOption}
+      onAdvance={vi.fn()}
+      onDismiss={vi.fn()}
+    />,
+  );
+
+  await expect.element(screen.getByText("Stable", { exact: true })).toBeVisible();
+  await expect.element(screen.getByText("Beta", { exact: true })).toBeVisible();
+  expect(
+    Array.from(screen.container.querySelectorAll("span")).filter(
+      (element) => element.textContent === "Recommended",
+    ),
+  ).toHaveLength(2);
+  // The marker never reaches the rendered text, even when a description repeats the label.
+  expect(screen.container.textContent).not.toContain("(Recommended)");
+
+  await userEvent.click(screen.getByText("Stable", { exact: true }));
+  await userEvent.click(screen.getByText("Beta", { exact: true }));
+
+  expect(onToggleOption.mock.calls).toEqual([
+    ["recommended-question", "stable-channel"],
+    ["recommended-question", "Beta (Recommended)"],
+  ]);
 });
 
 it("expands the panel height and remembers it across a remount", async () => {

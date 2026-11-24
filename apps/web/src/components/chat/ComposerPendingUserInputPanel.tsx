@@ -1,4 +1,4 @@
-/* oxlint-disable shadcn/no-arbitrary-values -- The panel's 15px option labels and 13px summaries and previews are design-specified sizes between the text-sm and text-base scale. */
+/* oxlint-disable shadcn/no-arbitrary-values -- The panel keeps design-specified sizes off the text-sm/text-base scale: text-[15px] for the question stem, text-[13px] for option labels, and text-[11px] for the recommendation badge. */
 import { type RuntimeRequestId, type ScopedThreadRef } from "@t3tools/contracts";
 import { markdownProseDirection, textDirection } from "~/textDirection";
 import { useGT } from "gt-react";
@@ -30,12 +30,12 @@ import { isInSideChatPane } from "~/lib/sideChatPane";
 import { ComposerBanner } from "./ComposerBanner";
 import ChatMarkdown from "../ChatMarkdown";
 
-type PendingUserInputViewMode = "single" | "all";
+export type PendingUserInputViewMode = "single" | "all";
 
 const VIEW_MODE_STORAGE_KEY = "t3code:pending-user-input:view-mode";
 const HEIGHT_EXPANDED_STORAGE_KEY = "t3code:pending-user-input:height-expanded";
 
-function readViewModePreference(): PendingUserInputViewMode {
+export function readPendingUserInputViewModePreference(): PendingUserInputViewMode {
   try {
     return window.localStorage.getItem(VIEW_MODE_STORAGE_KEY) === "all" ? "all" : "single";
   } catch {
@@ -43,7 +43,7 @@ function readViewModePreference(): PendingUserInputViewMode {
   }
 }
 
-function writeViewModePreference(viewMode: PendingUserInputViewMode): void {
+export function writePendingUserInputViewModePreference(viewMode: PendingUserInputViewMode): void {
   try {
     window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, viewMode);
   } catch {}
@@ -63,6 +63,71 @@ function writeHeightExpandedPreference(expanded: boolean): void {
   } catch {}
 }
 
+/**
+ * Providers that cannot enumerate their questions send the real question in `header` and a
+ * generic line in `question`, so the panel swaps them and numbers the header itself.
+ */
+const GENERIC_ELICITATION_QUESTION_RE = /^The agent has (?:\d+ questions?|a question)\.?$/i;
+const GENERIC_NUMBERED_HEADER_RE = /^Question\s+(\d+)$/i;
+const GENERIC_BARE_HEADER_RE = /^Question$/i;
+
+interface QuestionPresentation {
+  header: string;
+  isNumberedHeader: boolean;
+  question: string;
+}
+
+function resolveQuestionPresentation(
+  question: { header: string; question: string },
+  index: number,
+  gt: ReturnType<typeof useGT>,
+): QuestionPresentation {
+  const trimmedHeader = question.header.trim();
+  const trimmedQuestion = question.question.trim();
+  if (
+    GENERIC_ELICITATION_QUESTION_RE.test(trimmedQuestion) &&
+    trimmedHeader.length > 0 &&
+    !GENERIC_BARE_HEADER_RE.test(trimmedHeader) &&
+    !GENERIC_NUMBERED_HEADER_RE.test(trimmedHeader)
+  ) {
+    return {
+      header: gt("Question {number}", { number: index + 1 }),
+      isNumberedHeader: true,
+      question: trimmedHeader,
+    };
+  }
+  const numberedHeader = GENERIC_NUMBERED_HEADER_RE.exec(trimmedHeader);
+  if (numberedHeader) {
+    return {
+      header: gt("Question {number}", { number: Number(numberedHeader[1]) }),
+      isNumberedHeader: true,
+      question: question.question,
+    };
+  }
+  if (GENERIC_BARE_HEADER_RE.test(trimmedHeader)) {
+    return { header: gt("Question"), isNumberedHeader: false, question: question.question };
+  }
+  return { header: question.header, isNumberedHeader: false, question: question.question };
+}
+
+/**
+ * Strips the "(Recommended)" marker providers append to an option label or description, so the
+ * panel can render it as a badge. The option's value is never touched.
+ */
+function parseRecommendedOptionText(text: string): { text: string; isRecommended: boolean } {
+  const leading = /^\(\s*Recommended\s*\)\s*/i.exec(text);
+  if (leading) {
+    const trimmed = text.slice(leading[0].length).trim();
+    if (trimmed.length > 0) return { text: trimmed, isRecommended: true };
+  }
+  const trailing = /\s*\(\s*Recommended\s*\)$/i.exec(text);
+  if (trailing) {
+    const trimmed = text.slice(0, trailing.index).trim();
+    if (trimmed.length > 0) return { text: trimmed, isRecommended: true };
+  }
+  return { text, isRecommended: false };
+}
+
 interface PendingUserInputPanelProps {
   pendingUserInputs: PendingUserInput[];
   cwd: string | undefined;
@@ -75,6 +140,8 @@ interface PendingUserInputPanelProps {
   onAdvance: () => void;
   onDismiss: (requestId: RuntimeRequestId) => void;
   onSelectQuestionIndex?: ((questionIndex: number) => void) | undefined;
+  viewMode?: PendingUserInputViewMode | undefined;
+  onViewModeChange?: ((viewMode: PendingUserInputViewMode) => void) | undefined;
 }
 
 export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserInputPanel({
@@ -89,6 +156,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   onAdvance,
   onDismiss,
   onSelectQuestionIndex,
+  viewMode,
+  onViewModeChange,
 }: PendingUserInputPanelProps) {
   if (pendingUserInputs.length === 0) return null;
   const activePrompt = pendingUserInputs[0];
@@ -108,6 +177,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       onAdvance={onAdvance}
       onDismiss={onDismiss}
       onSelectQuestionIndex={onSelectQuestionIndex}
+      viewMode={viewMode}
+      onViewModeChange={onViewModeChange}
     />
   );
 });
@@ -124,6 +195,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   onAdvance,
   onDismiss,
   onSelectQuestionIndex,
+  viewMode: viewModeProp,
+  onViewModeChange,
 }: {
   prompt: PendingUserInput;
   cwd: string | undefined;
@@ -136,6 +209,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   onAdvance: () => void;
   onDismiss: (requestId: RuntimeRequestId) => void;
   onSelectQuestionIndex?: ((questionIndex: number) => void) | undefined;
+  viewMode?: PendingUserInputViewMode | undefined;
+  onViewModeChange?: ((viewMode: PendingUserInputViewMode) => void) | undefined;
 }) {
   const gt = useGT();
   // Message-mode requests remain answerable after their provider turn ends.
@@ -148,7 +223,10 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     optionValue: string;
   } | null>(null);
   const [collapsedQuestionId, setCollapsedQuestionId] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<PendingUserInputViewMode>(readViewModePreference);
+  const [uncontrolledViewMode, setUncontrolledViewMode] = useState<PendingUserInputViewMode>(
+    readPendingUserInputViewModePreference,
+  );
+  const viewMode = viewModeProp ?? uncontrolledViewMode;
   const [isHeightExpanded, setIsHeightExpanded] = useState<boolean>(readHeightExpandedPreference);
   const questionCardRefs = useRef(new Map<string, HTMLDivElement>());
   // Keep question identity stable for its shortcut listener.
@@ -201,8 +279,11 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   const handleToggleViewMode = () => {
     clearAutoAdvance();
     const nextViewMode = viewMode === "all" ? "single" : "all";
-    setViewMode(nextViewMode);
-    writeViewModePreference(nextViewMode);
+    onViewModeChange?.(nextViewMode);
+    if (viewModeProp === undefined) {
+      setUncontrolledViewMode(nextViewMode);
+      writePendingUserInputViewModePreference(nextViewMode);
+    }
   };
 
   const handleToggleHeightExpanded = () => {
@@ -272,16 +353,46 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     return () => document.removeEventListener("keydown", handler);
   }, [activeQuestion, backgroundThread, isCollapsed, responseDisabled]);
 
+  const previousActiveQuestionIdRef = useRef(activeQuestion?.id);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- scrolls the newly focused question card into view when navigating in all-questions view
+  useEffect(() => {
+    const previousId = previousActiveQuestionIdRef.current;
+    previousActiveQuestionIdRef.current = activeQuestion?.id;
+    const activeQuestionId = activeQuestion?.id;
+    if (
+      effectiveViewMode !== "all" ||
+      previousId === undefined ||
+      activeQuestionId === undefined ||
+      activeQuestionId === previousId
+    ) {
+      return;
+    }
+    questionCardRefs.current
+      .get(activeQuestionId)
+      ?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  }, [activeQuestion?.id, effectiveViewMode]);
+
   if (!activeQuestion) {
     return null;
   }
 
+  const questionPresentations = prompt.questions.map((question, index) =>
+    resolveQuestionPresentation(question, index, gt),
+  );
+  const activePresentation = questionPresentations[safeQuestionIndex] ?? {
+    header: activeQuestion.header,
+    isNumberedHeader: false,
+    question: activeQuestion.question,
+  };
   const promptDirection = markdownProseDirection(
-    prompt.questions
-      .flatMap((question) => [
-        question.header,
-        question.question,
-        ...question.options.flatMap((option) => [option.label, option.description ?? ""]),
+    questionPresentations
+      .flatMap((presentation, index) => [
+        presentation.header,
+        presentation.question,
+        ...(prompt.questions[index]?.options ?? []).flatMap((option) => [
+          option.label,
+          option.description ?? "",
+        ]),
       ])
       .join(" "),
   );
@@ -292,6 +403,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
 
   const renderQuestionBlock = (
     question: ThreadUserInputQuestion,
+    presentation: QuestionPresentation,
     options: { showShortcuts: boolean; onSelect: (optionValue: string) => void },
   ) => {
     const answer = answers[question.id];
@@ -308,18 +420,24 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     return (
       <>
         <ChatMarkdown
-          text={question.question}
+          text={presentation.question}
           cwd={cwd}
           threadRef={threadRef}
           lineBreaks
           className={cn(
-            "pt-0.5 text-base leading-relaxed font-medium text-foreground",
+            "pt-0.5 text-[15px] leading-relaxed font-semibold text-foreground",
             questionTextAlign,
           )}
         />
-        <div className="mt-2.5 space-y-1">
+        <div className="mt-2 space-y-1">
           {question.options.map((option, optionIndex) => {
             const optionValue = option.value ?? option.label;
+            const parsedLabel = parseRecommendedOptionText(option.label);
+            const parsedDescription = option.description
+              ? parseRecommendedOptionText(option.description)
+              : null;
+            const isRecommended =
+              parsedLabel.isRecommended || Boolean(parsedDescription?.isRecommended);
             const isSelected =
               optimisticValue === optionValue ||
               (!hasCustomAnswer && selectedOptionValues.includes(optionValue));
@@ -335,7 +453,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                   }}
                   className={cn(
                     questionTextAlign,
-                    "group flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 outline-none transition-colors duration-150 focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary/35",
+                    "group flex w-full items-start gap-2 rounded-md px-2.5 py-1.5 outline-none transition-colors duration-150 focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary/35",
                     isSelected
                       ? "bg-primary/8 text-foreground ring-1 ring-inset ring-primary/25"
                       : "bg-transparent text-foreground/85 hover:bg-muted/40",
@@ -343,7 +461,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                     !disabled && !isResponding && "cursor-pointer",
                   )}
                 >
-                  <span className="pointer-events-none flex h-[22px] shrink-0 items-center">
+                  <span className="pointer-events-none flex h-5 shrink-0 items-center">
                     {question.multiSelect ? (
                       <CheckboxMark checked={isSelected} variant="contrast" />
                     ) : (
@@ -351,23 +469,35 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                     )}
                   </span>
                   <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                    <span
-                      className="text-[15px] leading-snug font-medium"
-                      dir={textDirection(option.label)}
-                    >
-                      {option.label}
-                    </span>
-                    {option.description && option.description !== option.label ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
                       <span
-                        className="text-[13px] leading-relaxed text-secondary-label"
-                        dir={textDirection(option.description)}
+                        className={cn(
+                          "text-[13px] leading-snug",
+                          isSelected ? "font-medium" : "font-normal",
+                        )}
+                        dir={textDirection(parsedLabel.text)}
                       >
-                        {option.description}
+                        {parsedLabel.text}
+                      </span>
+                      {isRecommended ? (
+                        <span className="inline-flex shrink-0 items-center rounded-sm bg-primary/12 px-1.5 py-0.5 text-[11px] leading-none font-medium text-primary">
+                          {gt("Recommended")}
+                        </span>
+                      ) : null}
+                    </div>
+                    {parsedDescription &&
+                    parsedDescription.text.length > 0 &&
+                    parsedDescription.text !== parsedLabel.text ? (
+                      <span
+                        className="text-xs leading-relaxed text-secondary-label"
+                        dir={textDirection(parsedDescription.text)}
+                      >
+                        {parsedDescription.text}
                       </span>
                     ) : null}
                   </div>
                   {options.showShortcuts && optionIndex < 9 ? (
-                    <span className="flex h-[22px] w-7 shrink-0 items-center justify-center sm:w-6">
+                    <span className="flex h-5 w-6 shrink-0 items-center justify-center">
                       <Kbd>{optionIndex + 1}</Kbd>
                     </span>
                   ) : null}
@@ -378,7 +508,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                     cwd={cwd}
                     threadRef={threadRef}
                     lineBreaks
-                    className="ps-9 pe-2 pb-1.5 text-[13px] leading-relaxed text-foreground/75"
+                    className="ps-8 pe-2 pb-1.5 text-xs leading-relaxed text-foreground/75"
                   />
                 ) : null}
               </div>
@@ -408,39 +538,58 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           data-pending-user-input-toggle={isCollapsed ? "collapsed" : "expanded"}
           className="col-[1/3] row-start-1 flex min-w-0 cursor-pointer items-center gap-1.5 rounded-lg py-0.5 text-start hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
         >
-          <span
-            className={cn(
-              "min-w-0 truncate text-xs font-medium text-muted-foreground",
-              isCollapsed && "max-w-1/2",
-            )}
-            dir={textDirection(activeQuestion.header)}
-          >
-            {activeQuestion.header}
-          </span>
           {isCollapsed ? (
             <>
+              <span
+                className="min-w-0 max-w-1/2 truncate text-xs font-medium text-muted-foreground"
+                dir={textDirection(activePresentation.header)}
+              >
+                {activePresentation.header}
+              </span>
               <ComposerBanner.Separator />
               <span
                 className={cn(
                   "min-w-0 flex-1 truncate text-[13px] text-secondary-label",
                   questionTextAlign,
                 )}
-                dir={markdownProseDirection(activeQuestion.question)}
+                dir={markdownProseDirection(activePresentation.question)}
               >
-                {activeQuestion.question}
+                {activePresentation.question}
               </span>
             </>
-          ) : hasMultipleQuestions ? (
-            <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-              {gt("{answered}/{total} answered", {
-                answered: progress.answeredQuestionCount,
-                total: prompt.questions.length,
-              })}
-            </span>
-          ) : null}
+          ) : effectiveViewMode === "all" ? (
+            <>
+              <span className="min-w-0 truncate text-xs font-medium text-muted-foreground">
+                {gt("All questions")}
+              </span>
+              <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                {gt("{answered}/{total} answered", {
+                  answered: progress.answeredQuestionCount,
+                  total: prompt.questions.length,
+                })}
+              </span>
+            </>
+          ) : (
+            <>
+              <span
+                className="min-w-0 truncate text-xs font-medium text-muted-foreground"
+                dir={textDirection(activePresentation.header)}
+              >
+                {activePresentation.header}
+              </span>
+              {hasMultipleQuestions ? (
+                <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                  {gt("{answered}/{total} answered", {
+                    answered: progress.answeredQuestionCount,
+                    total: prompt.questions.length,
+                  })}
+                </span>
+              ) : null}
+            </>
+          )}
         </CollapsibleTrigger>
         <ComposerBanner.Actions className="gap-1">
-          {hasMultipleQuestions ? (
+          {hasMultipleQuestions && effectiveViewMode === "single" ? (
             <>
               <Button
                 type="button"
@@ -473,23 +622,25 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               >
                 <ChevronRightIcon className="size-3.5" />
               </Button>
-              <Button
-                type="button"
-                size="xs"
-                variant={viewMode === "all" ? "secondary" : "ghost"}
-                aria-pressed={viewMode === "all"}
-                title={
-                  viewMode === "all"
-                    ? gt("View one question at a time")
-                    : gt("View all questions together")
-                }
-                data-pending-user-input-view-mode={viewMode}
-                onClick={handleToggleViewMode}
-              >
-                <ListIcon className="size-3.5" />
-                {viewMode === "all" ? gt("Single") : gt("All")}
-              </Button>
             </>
+          ) : null}
+          {hasMultipleQuestions ? (
+            <Button
+              type="button"
+              size="xs"
+              variant={viewMode === "all" ? "secondary" : "ghost"}
+              aria-pressed={viewMode === "all"}
+              title={
+                viewMode === "all"
+                  ? gt("View one question at a time")
+                  : gt("View all questions together")
+              }
+              data-pending-user-input-view-mode={viewMode}
+              onClick={handleToggleViewMode}
+            >
+              <ListIcon className="size-3.5" />
+              {viewMode === "all" ? gt("Single") : gt("All")}
+            </Button>
           ) : null}
           {!isCollapsed ? (
             <Button
@@ -552,55 +703,6 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         </ComposerBanner.Actions>
       </ComposerBanner.Row>
       <CollapsiblePanel>
-        {hasMultipleQuestions ? (
-          <div
-            role="navigation"
-            aria-label={gt("Questions")}
-            data-pending-user-input-stepper
-            className="flex items-center gap-1.5 overflow-x-auto border-y border-border/50 bg-muted/20 px-4 py-1.5"
-          >
-            {prompt.questions.map((question, index) => {
-              const isActive = index === safeQuestionIndex;
-              const isAnswered = answeredQuestionIdSet.has(question.id);
-              return (
-                <button
-                  type="button"
-                  key={question.id}
-                  data-pending-question-tab={index}
-                  aria-current={isActive ? "step" : undefined}
-                  // oxlint-disable-next-line t3code/no-native-title-tooltip -- the tab's title names its truncated header; the full label sits in the card below
-                  title={question.header}
-                  disabled={isResponding || !onSelectQuestionIndex}
-                  onClick={() => {
-                    handleSelectQuestionIndex(index);
-                    if (effectiveViewMode === "all") {
-                      questionCardRefs.current
-                        .get(question.id)
-                        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-                    }
-                  }}
-                  className={cn(
-                    "inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                    isActive
-                      ? "border-primary/45 bg-primary/12 font-medium text-foreground"
-                      : isAnswered
-                        ? "border-border/70 bg-background/70 text-foreground/85 hover:bg-muted/50"
-                        : "border-transparent bg-transparent text-muted-foreground hover:bg-muted/40 hover:text-foreground",
-                  )}
-                >
-                  {isAnswered ? (
-                    <CheckIcon className="size-3 shrink-0 text-primary" aria-hidden />
-                  ) : (
-                    <span className="tabular-nums opacity-75">{index + 1}</span>
-                  )}
-                  <span className="max-w-44 truncate" dir={textDirection(question.header)}>
-                    {question.header}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        ) : null}
         <ComposerBanner.Scroll
           className={isHeightExpanded ? "max-h-[min(48rem,76dvh)]" : "max-h-[min(36rem,58dvh)]"}
         >
@@ -612,6 +714,11 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                   const isActive = index === safeQuestionIndex;
                   const isAnswered = answeredQuestionIdSet.has(question.id);
                   const questionCustomAnswerValue = questionCustomAnswer(question);
+                  const presentation = questionPresentations[index] ?? {
+                    header: question.header,
+                    isNumberedHeader: false,
+                    question: question.question,
+                  };
                   return (
                     <div
                       key={question.id}
@@ -633,14 +740,16 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                       )}
                     >
                       <div className="mb-2 flex items-center gap-2">
-                        <span className="text-xs font-medium text-muted-foreground tabular-nums">
-                          {index + 1}.
-                        </span>
+                        {presentation.isNumberedHeader ? null : (
+                          <span className="text-xs font-medium text-muted-foreground tabular-nums">
+                            {index + 1}.
+                          </span>
+                        )}
                         <span
                           className="min-w-0 flex-1 truncate text-xs font-medium text-foreground"
-                          dir={textDirection(question.header)}
+                          dir={textDirection(presentation.header)}
                         >
-                          {question.header}
+                          {presentation.header}
                         </span>
                         {isActive ? (
                           <span className="size-1.5 shrink-0 rounded-full bg-primary" aria-hidden />
@@ -649,7 +758,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                           <CheckIcon className="size-3.5 shrink-0 text-primary" aria-hidden />
                         ) : null}
                       </div>
-                      {renderQuestionBlock(question, {
+                      {renderQuestionBlock(question, presentation, {
                         showShortcuts: isActive,
                         onSelect: (optionValue) =>
                           handleOptionSelection(question.id, optionValue, index),
@@ -668,7 +777,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               </div>
             ) : (
               // oxlint-disable-next-line react/refs -- renderQuestionBlock only renders; the card ref map is written by callback refs after commit
-              renderQuestionBlock(activeQuestion, {
+              renderQuestionBlock(activeQuestion, activePresentation, {
                 showShortcuts: true,
                 onSelect: (optionValue) => handleOptionSelection(activeQuestion.id, optionValue),
               })

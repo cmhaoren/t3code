@@ -12532,8 +12532,10 @@
   "045741aa62df51f8": "All",
   "d115b4f051d2c1c3": "Restore question panel height",
   "d4f01ddf64f3277c": "Expand question panel height",
-  "dd3f019dd4a099fb": "Questions",
   "400fb20a5b7e7e83": "Custom answer",
   "1ad2ff9da5552c0e": "Q{number}",
-  "42b390b499323580": "Go to question {number}"
+  "42b390b499323580": "Go to question {number}",
+  "4cde26ac2c45d0cb": "Question {number}",
+  "5c8772e727c04218": "Question",
+  "2049ca3dea845d51": "All questions"
 }

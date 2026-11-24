@@ -33,6 +33,7 @@ interface PendingActionState {
   questionIndex: number;
   questionCount?: number;
   isLastQuestion: boolean;
+  allQuestionsView?: boolean;
   canAdvance: boolean;
   isResponding: boolean;
   isComplete: boolean;
@@ -69,6 +70,7 @@ interface ComposerPrimaryActionsProps {
   onPreviousPendingQuestion: () => void;
   onNextPendingQuestion?: (() => void) | undefined;
   onSelectPendingQuestionIndex?: ((questionIndex: number) => void) | undefined;
+  onSubmitPendingAnswers?: (() => void) | undefined;
   onInterrupt: () => void;
   compactBeforeSendTokens?: number | null;
   hideCompactToggle?: boolean;
@@ -80,6 +82,7 @@ const formatPendingPrimaryActionLabel = (
   input: {
     compact: boolean;
     isLastQuestion: boolean;
+    isMultipleQuestions: boolean;
     isResponding: boolean;
     questionIndex: number;
     firstUnansweredQuestionIndex?: number | null;
@@ -104,7 +107,7 @@ const formatPendingPrimaryActionLabel = (
   if (!input.isLastQuestion) {
     return resolve(msg("Next question"));
   }
-  return input.questionIndex > 0 ? resolve(msg("Submit answers")) : resolve(msg("Submit answer"));
+  return input.isMultipleQuestions ? resolve(msg("Submit answers")) : resolve(msg("Submit answer"));
 };
 
 const STOP_PENDING_MAX_MS = 10_000;
@@ -272,6 +275,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   onPreviousPendingQuestion,
   onNextPendingQuestion,
   onSelectPendingQuestionIndex,
+  onSubmitPendingAnswers,
   onInterrupt,
   compactBeforeSendTokens = null,
   hideCompactToggle = false,
@@ -321,22 +325,31 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   );
 
   if (pendingAction) {
+    const isAllView = pendingAction.allQuestionsView === true;
+    const effectiveIsSubmitStage = isAllView || pendingAction.isLastQuestion;
+    const isMultipleQuestions =
+      (pendingAction.questionCount ?? (pendingAction.questionIndex > 0 ? 2 : 1)) > 1;
     const firstUnansweredQuestionIndex = pendingAction.firstUnansweredQuestionIndex ?? null;
     const canJumpToUnanswered =
-      pendingAction.isLastQuestion &&
+      effectiveIsSubmitStage &&
       !pendingAction.isComplete &&
       !voiceInputActive &&
       firstUnansweredQuestionIndex !== null &&
       firstUnansweredQuestionIndex !== pendingAction.questionIndex &&
       onSelectPendingQuestionIndex !== undefined;
     const canBrowseNextUnanswered =
-      !pendingAction.isLastQuestion &&
+      !effectiveIsSubmitStage &&
       !pendingAction.canAdvance &&
       !voiceInputActive &&
       onNextPendingQuestion !== undefined;
+    const canDirectSubmitAllView =
+      isAllView &&
+      pendingAction.isComplete &&
+      !voiceInputActive &&
+      onSubmitPendingAnswers !== undefined;
     return (
       <div className={cn("flex items-center justify-end", compact ? "gap-1.5" : "gap-2")}>
-        {pendingAction.questionIndex > 0 ? (
+        {!isAllView && pendingAction.questionIndex > 0 ? (
           compact ? (
             <Button
               size="icon-sm"
@@ -375,6 +388,11 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
               onSelectPendingQuestionIndex(firstUnansweredQuestionIndex);
               return;
             }
+            if (canDirectSubmitAllView) {
+              event.preventDefault();
+              onSubmitPendingAnswers();
+              return;
+            }
             if (canBrowseNextUnanswered) {
               event.preventDefault();
               onNextPendingQuestion();
@@ -386,7 +404,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
             isSendDisabled ||
             pendingAction.isResponding ||
             (!voiceInputActive &&
-              (pendingAction.isLastQuestion
+              (effectiveIsSubmitStage
                 ? !pendingAction.isComplete && !canJumpToUnanswered
                 : !pendingAction.canAdvance && !canBrowseNextUnanswered))
           }
@@ -394,7 +412,8 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           {formatPendingPrimaryActionLabel(
             {
               compact,
-              isLastQuestion: pendingAction.isLastQuestion,
+              isLastQuestion: effectiveIsSubmitStage,
+              isMultipleQuestions,
               isResponding: pendingAction.isResponding,
               questionIndex: pendingAction.questionIndex,
               firstUnansweredQuestionIndex,

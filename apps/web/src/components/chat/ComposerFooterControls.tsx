@@ -200,6 +200,7 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
     questionIndex: number;
     questionCount?: number;
     isLastQuestion: boolean;
+    allQuestionsView?: boolean;
     canAdvance: boolean;
     isResponding: boolean;
     isComplete: boolean;
@@ -226,6 +227,7 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
   onPreviousPendingQuestion: () => void;
   onNextPendingQuestion?: (() => void) | undefined;
   onSelectPendingQuestionIndex?: ((questionIndex: number) => void) | undefined;
+  onSubmitPendingAnswers?: (() => void) | undefined;
   onInterrupt: () => void;
   compactBeforeSendTokens: number | null;
   hideCompactToggle: boolean;
@@ -259,6 +261,7 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
         onPreviousPendingQuestion={props.onPreviousPendingQuestion}
         onNextPendingQuestion={props.onNextPendingQuestion}
         onSelectPendingQuestionIndex={props.onSelectPendingQuestionIndex}
+        onSubmitPendingAnswers={props.onSubmitPendingAnswers}
         onInterrupt={props.onInterrupt}
         compactBeforeSendTokens={props.compactBeforeSendTokens}
         hideCompactToggle={props.hideCompactToggle}

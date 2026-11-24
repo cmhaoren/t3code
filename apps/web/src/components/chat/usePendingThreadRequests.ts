@@ -682,6 +682,17 @@ export function usePendingThreadRequests(input: {
     onSelectActivePendingUserInputQuestionIndex,
   );
 
+  const onSubmitActivePendingUserInput = () => {
+    if (!activePendingUserInput || activePendingUserInput.responseCapability === "not_resumable") {
+      return;
+    }
+    const { activePendingResolvedAnswers } = readPendingUserInputDraft(draftScope);
+    if (activePendingResolvedAnswers) {
+      void onRespondToUserInput(activePendingUserInput.requestId, activePendingResolvedAnswers);
+    }
+  };
+  const onSubmitActivePendingUserInputStable = useStableCallback(onSubmitActivePendingUserInput);
+
   return {
     pendingApprovals,
     pendingUserInputs,
@@ -697,5 +708,6 @@ export function usePendingThreadRequests(input: {
     onAdvanceActivePendingUserInputStable,
     onPreviousActivePendingUserInputQuestion: onPreviousActivePendingUserInputQuestionStable,
     onSelectActivePendingUserInputQuestionIndex: onSelectActivePendingUserInputQuestionIndexStable,
+    onSubmitActivePendingUserInput: onSubmitActivePendingUserInputStable,
   };
 }

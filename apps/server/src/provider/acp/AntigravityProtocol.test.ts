@@ -4,6 +4,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import * as AcpWireSchema from "effect-acp/schema-v1";
 
 import {
+  extractAntigravityElicitationForm,
   extractAntigravityUserInputQuestion,
   antigravityApprovalOptions,
   antigravitySubagentOutput,
@@ -725,5 +726,297 @@ describe("Antigravity served reads", () => {
       toolCallId: "call_current",
       status: "completed",
     });
+  });
+});
+
+describe("Antigravity elicitation questions", () => {
+  type ElicitationRequest = Extract<EffectAcpSchema.CreateElicitationRequest, { mode: "form" }>;
+
+  const request = (
+    properties: Record<string, unknown>,
+    message = "The agent has 3 questions.",
+  ): ElicitationRequest =>
+    ({
+      mode: "form",
+      sessionId: "session-1",
+      message,
+      requestedSchema: { type: "object", properties },
+    }) as ElicitationRequest;
+
+  const other = (question: string) => ({
+    type: "string",
+    title: "Other",
+    description: `Optional free-form answer to: ${question}`,
+  });
+  const choice = (constValue: string, title: string, description?: string) => ({
+    const: constValue,
+    title,
+    ...(description === undefined ? {} : { description }),
+  });
+  const single = (title: string, options: ReadonlyArray<ReturnType<typeof choice>>) => ({
+    type: "string",
+    title,
+    oneOf: options,
+  });
+  const multi = (title: string, options: ReadonlyArray<ReturnType<typeof choice>>) => ({
+    type: "array",
+    title,
+    items: { anyOf: options },
+  });
+
+  const threeQuestionForm = () =>
+    request({
+      q1: single("Which database should we use?", [
+        choice("1", "Postgres (Recommended)"),
+        choice("2", "SQLite"),
+      ]),
+      q1_other: other("Which database should we use?"),
+      q2: multi("Which platforms should we target?", [
+        choice("1", "Web"),
+        choice("2", "Desktop"),
+        choice("3", "Mobile"),
+      ]),
+      q2_other: other("Which platforms should we target?"),
+      q3: single("Should I add tests?", [choice("4", "Yes"), choice("5", "No")]),
+      q3_other: other("Should I add tests?"),
+    });
+
+  it("folds each qN_other companion into its question", () => {
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.questions.length).toBe(3);
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Question 1",
+        question: "Which database should we use?",
+        options: [
+          { label: "Postgres (Recommended)", value: "1", description: "Postgres (Recommended)" },
+          { label: "SQLite", value: "2", description: "SQLite" },
+        ],
+      },
+      {
+        id: "q2",
+        header: "Question 2",
+        question: "Which platforms should we target?",
+        multiSelect: true,
+        options: [
+          { label: "Web", value: "1", description: "Web" },
+          { label: "Desktop", value: "2", description: "Desktop" },
+          { label: "Mobile", value: "3", description: "Mobile" },
+        ],
+      },
+      {
+        id: "q3",
+        header: "Question 3",
+        question: "Should I add tests?",
+        options: [
+          { label: "Yes", value: "4", description: "Yes" },
+          { label: "No", value: "5", description: "No" },
+        ],
+      },
+    ]);
+    expect(form?.questions.map((question) => question.multiSelect)).toEqual([
+      undefined,
+      true,
+      undefined,
+    ]);
+    for (const question of form?.questions ?? []) {
+      expect(question.allowCustomAnswer).toBeUndefined();
+    }
+  });
+
+  it("reads enum choices for single- and multi-select questions", () => {
+    const form = extractAntigravityElicitationForm(
+      request({
+        q1: {
+          type: "string",
+          title: "Pick a size",
+          description: "Which size fits?",
+          enum: ["S", "M"],
+        },
+        q1_other: other("Pick a size"),
+        q2: {
+          type: "array",
+          title: "Pick toppings",
+          items: { type: "string", enum: ["cheese", "olives"] },
+        },
+        q2_other: other("Pick toppings"),
+      }),
+    );
+
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Which size fits?",
+        question: "Pick a size",
+        options: [
+          { label: "S", value: "S", description: "S" },
+          { label: "M", value: "M", description: "M" },
+        ],
+      },
+      {
+        id: "q2",
+        header: "Question 2",
+        question: "Pick toppings",
+        multiSelect: true,
+        options: [
+          { label: "cheese", value: "cheese", description: "cheese" },
+          { label: "olives", value: "olives", description: "olives" },
+        ],
+      },
+    ]);
+
+    const withoutItemType = extractAntigravityElicitationForm(
+      request({
+        q1: { type: "array", title: "Pick toppings", items: { enum: ["cheese"] } },
+        q1_other: other("Pick toppings"),
+      }),
+    );
+    expect(withoutItemType?.questions[0]).toMatchObject({
+      multiSelect: true,
+      options: [{ label: "cheese", value: "cheese", description: "cheese" }],
+    });
+  });
+
+  it("accepts selected choices and de-duplicates a multi-select answer", () => {
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.respond({ q1: "1", q2: ["2", "3", "2"], q3: "4" })).toEqual({
+      action: "accept",
+      content: { q1: "1", q2: ["2", "3"], q3: "4" },
+    });
+  });
+
+  it("sends free-form text to the companion of each question", () => {
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.respond({ q1: "Use MongoDB", q2: "Also a CLI app", q3: "4" })).toEqual({
+      action: "accept",
+      content: { q1_other: "Use MongoDB", q2_other: "Also a CLI app", q3: "4" },
+    });
+  });
+
+  it("keeps attachment text with the selected choice", () => {
+    const attachment = '\n\nAttached image "shot.png": "/tmp/shot.png"';
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.respond({ q1: `1${attachment}`, q2: `2${attachment}`, q3: "4" })).toEqual({
+      action: "accept",
+      content: {
+        q1: "1",
+        q1_other: `Postgres (Recommended)${attachment}`,
+        q2: ["2"],
+        q2_other: `Desktop${attachment}`,
+        q3: "4",
+      },
+    });
+  });
+
+  it("cancels incomplete or unknown answers", () => {
+    const form = extractAntigravityElicitationForm(threeQuestionForm());
+
+    expect(form?.respond({})).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: "   ", q2: ["2"], q3: "4" })).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: "1", q2: [], q3: "4" })).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: "1", q2: ["9"], q3: "4" })).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: ["1"], q2: ["2"], q3: "4" })).toEqual({ action: "cancel" });
+  });
+
+  it("leaves any other elicitation form to the generic mapping", () => {
+    const validQuestion = single("Pick one", [choice("1", "One")]);
+    const pair = (overrides: Record<string, unknown> = {}) => ({
+      q1: validQuestion,
+      q1_other: other("Pick one"),
+      ...overrides,
+    });
+
+    expect(
+      extractAntigravityElicitationForm({
+        ...threeQuestionForm(),
+        mode: "url",
+      } as unknown as ElicitationRequest),
+    ).toBeUndefined();
+    expect(extractAntigravityElicitationForm(request({ q1: validQuestion }))).toBeUndefined();
+    expect(extractAntigravityElicitationForm(request(pair({ extra: {} })))).toBeUndefined();
+    expect(
+      extractAntigravityElicitationForm(
+        request(pair({ q1_other: { type: "string", title: "Other answer" } })),
+      ),
+    ).toBeUndefined();
+    expect(
+      extractAntigravityElicitationForm(request({ q0: validQuestion, q0_other: other("Q0") })),
+    ).toBeUndefined();
+    expect(
+      extractAntigravityElicitationForm(request(pair({ q1: single("Pick one", []) }))),
+    ).toBeUndefined();
+  });
+
+  it("allows ACP metadata and nullable descriptions while rejecting conflicting option keywords", () => {
+    const form = extractAntigravityElicitationForm(
+      request({
+        q1: {
+          type: "string",
+          title: "Pick runtime",
+          description: null,
+          default: "node",
+          enum: null,
+          _meta: null,
+          oneOf: [{ const: "node", title: "Node.js", description: null }],
+        },
+        q1_other: {
+          type: "string",
+          title: "Other",
+          description: null,
+          _meta: { source: "ask_question" },
+        },
+        q2: {
+          type: "array",
+          title: "Pick targets",
+          description: null,
+          minItems: 0,
+          maxItems: 4,
+          uniqueItems: true,
+          items: {
+            type: "string",
+            anyOf: [choice("win", "Windows"), choice("mac", "macOS")],
+          },
+        },
+        q2_other: other("Pick targets"),
+      }),
+    );
+
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Question 1",
+        question: "Pick runtime",
+        options: [{ label: "Node.js", value: "node", description: "Node.js" }],
+      },
+      {
+        id: "q2",
+        header: "Question 2",
+        question: "Pick targets",
+        multiSelect: true,
+        options: [
+          { label: "Windows", value: "win", description: "Windows" },
+          { label: "macOS", value: "mac", description: "macOS" },
+        ],
+      },
+    ]);
+
+    expect(
+      extractAntigravityElicitationForm(
+        request({
+          q1: {
+            type: "string",
+            title: "Conflicting",
+            oneOf: [choice("a", "A")],
+            enum: ["a"],
+          },
+          q1_other: other("Conflicting"),
+        }),
+      ),
+    ).toBeUndefined();
   });
 });
