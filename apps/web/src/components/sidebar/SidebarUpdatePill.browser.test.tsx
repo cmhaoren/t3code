@@ -168,3 +168,28 @@ describe("SidebarUpdatePill update everything", () => {
     await expect.element(row.getByRole("cell", { name: "Claude", exact: true })).toBeVisible();
   });
 });
+
+describe("SidebarUpdatePill disabled updates", () => {
+  it("renders nothing when desktop auto-updates are disabled and no fleet updates exist", async () => {
+    setup({
+      ...nightlyUpdate([]),
+      enabled: false,
+      status: "disabled",
+      availableVersion: null,
+      message: "Automatic updates are disabled by the T3CODE_DISABLE_AUTO_UPDATE setting.",
+    });
+    await using screen = await render(<SidebarUpdatePill />);
+    expect(screen.container.querySelector("button")).toBeNull();
+  });
+
+  it("renders the Check for updates button when desktop updates are enabled", async () => {
+    setup({
+      ...nightlyUpdate([]),
+      enabled: true,
+      status: "idle",
+      availableVersion: null,
+    });
+    await using screen = await render(<SidebarUpdatePill />);
+    await expect.element(screen.getByRole("button", { name: "Check for updates" })).toBeVisible();
+  });
+});

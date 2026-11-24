@@ -409,7 +409,9 @@ function SidebarUpdateControl() {
     );
   };
 
-  if (!isElectron && !runsEverything && !isRunningEverything) return null;
+  const isDesktopUpdateEnabled =
+    isElectron && state !== null && state.enabled && state.status !== "disabled";
+  if (!isDesktopUpdateEnabled && !runsEverything && !isRunningEverything) return null;
 
   const statusIcon = (
     <DesktopUpdateStatusIcon
