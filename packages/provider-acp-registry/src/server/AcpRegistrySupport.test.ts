@@ -610,6 +610,86 @@ describe("AcpRegistrySupport", () => {
     ),
   );
 
+  it.effect(
+    "unwraps DeepSeek Harness Desktop cmd shim via stat when Electron ASAR makes exists() return false for .asar",
+    () =>
+      Effect.gen(function* () {
+        const realFileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cacheDir = yield* realFileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-asar-stat-",
+        });
+        const bin = path.join(cacheDir, "resources", "runtime", "cli", "bin");
+        const exe = path.join(cacheDir, "DeepSeek Harness.exe");
+        const asarFile = path.join(cacheDir, "resources", "app.asar");
+        const cli = path.join(
+          asarFile,
+          "dsh",
+          "node_modules",
+          "@deepseek-ai",
+          "dsh-desktop-host",
+          "lib",
+          "cli.js",
+        );
+        const shim = path.join(bin, "dsh.cmd");
+        yield* realFileSystem.makeDirectory(bin, { recursive: true });
+        yield* realFileSystem.makeDirectory(path.dirname(asarFile), { recursive: true });
+        yield* realFileSystem.writeFileString(exe, "");
+        yield* realFileSystem.writeFileString(asarFile, "packed-asar");
+        const relative = (...parts: ReadonlyArray<string>) => parts.join(path.sep);
+        yield* realFileSystem.writeFileString(
+          shim,
+          [
+            "@echo off",
+            "setlocal DisableDelayedExpansion",
+            'set "ELECTRON_RUN_AS_NODE=1"',
+            `"%~dp0${relative("..", "..", "..", "..", "DeepSeek Harness.exe")}" --expose-internals "%~dp0${relative("..", "..", "..", "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh-desktop-host", "lib", "cli.js")}" %*`,
+            "exit /b %errorlevel%",
+          ].join("\r\n"),
+        );
+
+        const electronAsarFileSystem: FileSystem.FileSystem = {
+          ...realFileSystem,
+          exists: (filePath) =>
+            filePath === asarFile ? Effect.succeed(false) : realFileSystem.exists(filePath),
+        };
+        const environment = { PATH: cacheDir, ELECTRON_RUN_AS_NODE: "0" };
+        const catalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+          cacheDir,
+          toolsDir: path.join(cacheDir, "tools"),
+          registryUrl,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, electronAsarFileSystem),
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(SpawnExecutableResolution, () => shim),
+        );
+        const localSettings = decodeAcpRegistrySettings({
+          source: "local",
+          commandPath: "dsh",
+          commandArgs: ["--profile", "acp"],
+        });
+        expect(yield* catalog.inspect(localSettings, environment)).toEqual({
+          status: "ready",
+          agentId: "dsh",
+          version: null,
+          distribution: "local",
+        });
+        expect(yield* catalog.resolve(localSettings, "/workspace", environment)).toEqual({
+          distribution: "local",
+          spawn: {
+            command: exe,
+            args: ["--expose-internals", cli, "--profile", "acp"],
+            cwd: "/workspace",
+            env: { ...environment, ELECTRON_RUN_AS_NODE: "1" },
+            shell: false,
+          },
+        });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layerResolver(() => Effect.die("unexpected registry request"))),
+      ),
+  );
+
   it.effect("resolves the local Command Code configurations the HTTP selector matches", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

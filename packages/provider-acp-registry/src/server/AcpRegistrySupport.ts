@@ -2632,7 +2632,20 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
     });
     if (launch === undefined) return undefined;
     for (const file of launch.requiredFiles) {
-      const exists = yield* fileSystem.exists(file).pipe(Effect.orElseSucceed(() => false));
+      // Electron's ASAR fs patch returns ENOENT for fs.promises.access(".../app.asar")
+      // even when the archive exists on disk, whereas fs.promises.stat succeeds in both
+      // Electron and plain Node.js.
+      const exists = yield* fileSystem.exists(file).pipe(
+        Effect.orElseSucceed(() => false),
+        Effect.flatMap((ok) =>
+          ok
+            ? Effect.succeed(true)
+            : fileSystem.stat(file).pipe(
+                Effect.as(true),
+                Effect.orElseSucceed(() => false),
+              ),
+        ),
+      );
       if (!exists) return undefined;
     }
     return launch;
