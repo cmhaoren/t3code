@@ -13,6 +13,7 @@ import {
 import { msg } from "gt-react";
 
 import { m } from "../../i18n/messages";
+import { isDeepSeekHarnessAcpConfig } from "../../providerInstances";
 
 export interface ProviderEnvironmentOptionLike {
   readonly environmentId: EnvironmentId;
@@ -156,30 +157,7 @@ function titleCaseAgentId(agentId: string): string {
   return words.length > 0 ? words.join(" ") : agentId;
 }
 
-const DSH_BINARY_NAME = /^dsh(?:\.cmd|\.exe)?$/iu;
-const DSH_DESKTOP_EXE_NAME = /^deepseek harness(?:\.exe)?$/iu;
-const DSH_ENTRYPOINT_ARG = /(?:^|[\\/])@deepseek-ai[\\/]dsh(?:-desktop-host)?[\\/]/iu;
 const DSH_REGISTRY_AGENT_IDS: ReadonlySet<string> = new Set(["deepseek-harness", "dsh"]);
-
-function executableBasename(commandPath: string): string {
-  return commandPath.trim().split(/[\\/]/u).pop() ?? "";
-}
-
-/**
- * Detect DeepSeek Harness commands: the `dsh` CLI / desktop executable, or an
- * unwrapped Electron-as-Node launch whose entrypoint lives under `@deepseek-ai/dsh`.
- */
-function isDeepSeekHarnessConfig(config: unknown): boolean {
-  const commandPath = configText(config, "commandPath");
-  if (commandPath !== null) {
-    const basename = executableBasename(commandPath);
-    if (DSH_BINARY_NAME.test(basename) || DSH_DESKTOP_EXE_NAME.test(basename)) return true;
-  }
-  if (config === null || typeof config !== "object") return false;
-  const commandArgs = (config as Record<string, unknown>)["commandArgs"];
-  if (!Array.isArray(commandArgs)) return false;
-  return commandArgs.some((arg) => typeof arg === "string" && DSH_ENTRYPOINT_ARG.test(arg));
-}
 
 export function resolveProviderGroupIdentity(input: {
   readonly driver: ProviderDriverKind;
@@ -203,7 +181,7 @@ export function resolveProviderGroupIdentity(input: {
       ...(iconUrl !== null ? { acpRegistryIconUrl: iconUrl } : {}),
     });
     if (source === "local") {
-      if (isDeepSeekHarnessConfig(input.config)) {
+      if (isDeepSeekHarnessAcpConfig(input.config)) {
         return deepSeekHarnessGroup("deepseek-harness");
       }
       return { groupKey: "acp:local", groupLabel: m(msg("Local ACP")) };

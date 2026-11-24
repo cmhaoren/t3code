@@ -20,4 +20,22 @@ describe("resolveProviderInstanceAcpRegistryIconUrl", () => {
       }),
     ).toBe("https://cdn.agentclientprotocol.com/registry/v1/latest/generic-agent.svg");
   });
+
+  it("skips synthesized registry CDN URLs for DeepSeek Harness so the local DeepSeek icon renders", () => {
+    for (const agentId of ["deepseek-harness", "dsh"]) {
+      expect(
+        resolveProviderInstanceAcpRegistryIconUrl({
+          driverKind: ProviderDriverKind.make("acpRegistry"),
+          agentId,
+        }),
+      ).toBeNull();
+      expect(
+        resolveProviderInstanceAcpRegistryIconUrl({
+          driverKind: ProviderDriverKind.make("acpRegistry"),
+          agentId,
+          iconUrl: "https://cdn.agentclientprotocol.com/registry/icons/deepseek-harness.svg",
+        }),
+      ).toBe("https://cdn.agentclientprotocol.com/registry/icons/deepseek-harness.svg");
+    }
+  });
 });

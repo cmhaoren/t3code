@@ -626,7 +626,7 @@ describe("provider icon metadata", () => {
           [instanceId]: {
             driver,
             enabled: false,
-            config: { ...registryConfig, source: "local", commandPath: "dsh" },
+            config: { ...registryConfig, source: "local", commandPath: "my-local-acp" },
           },
         },
         projectSettingsOverrides: {},
@@ -649,5 +649,40 @@ describe("provider icon metadata", () => {
     expect(restoredEntry?.acpRegistryAgentId).toBe("swe-agent");
     expect(restoredEntry?.acpRegistryIconUrl).toBe(iconUrl);
     expect(restoredEntry?.enabled).toBe(true);
+  });
+
+  it("brands local DeepSeek Harness configurations with deepseek-harness and drops stale registry URLs", () => {
+    const instanceId = ProviderInstanceId.make("dsh");
+    const driver = ProviderDriverKind.make("acpRegistry");
+    const snapshots = deriveProviderInstanceEntries([
+      {
+        ...provider({ provider: driver, instanceId }),
+        iconUrl: "https://cdn.agentclientprotocol.com/registry/icons/stale.svg",
+      },
+    ]);
+    for (const config of [
+      { source: "local", commandPath: "C:\\tools\\dsh.cmd", commandArgs: ["--profile", "acp"] },
+      {
+        source: "local",
+        commandPath: "C:\\Program Files\\DeepSeek Harness\\DeepSeek Harness.exe",
+        commandArgs: [
+          "--expose-internals",
+          "C:\\Program Files\\DeepSeek Harness\\resources\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js",
+          "--profile",
+          "acp",
+        ],
+      },
+    ]) {
+      const [entry] = applyProviderInstanceSettings(
+        snapshots,
+        {
+          providerInstances: { [instanceId]: { driver, enabled: true, config } },
+          projectSettingsOverrides: {},
+        },
+        null,
+      );
+      expect(entry?.acpRegistryAgentId).toBe("deepseek-harness");
+      expect(entry?.acpRegistryIconUrl).toBeUndefined();
+    }
   });
 });

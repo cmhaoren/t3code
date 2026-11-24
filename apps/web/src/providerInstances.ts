@@ -158,6 +158,31 @@ export function applyProviderInstanceSettings(
   });
 }
 
+const DSH_BINARY_NAME = /^dsh(?:\.cmd|\.exe)?$/iu;
+const DSH_DESKTOP_EXE_NAME = /^deepseek harness(?:\.exe)?$/iu;
+const DSH_ENTRYPOINT_ARG = /(?:^|[\\/])@deepseek-ai[\\/]dsh(?:-desktop-host)?[\\/]/iu;
+
+function executableBasename(commandPath: string): string {
+  return commandPath.trim().split(/[\\/]/u).pop() ?? "";
+}
+
+/**
+ * Detect DeepSeek Harness commands: the `dsh` CLI / desktop executable, or an
+ * unwrapped Electron-as-Node launch whose entrypoint lives under `@deepseek-ai/dsh`.
+ */
+export function isDeepSeekHarnessAcpConfig(config: unknown): boolean {
+  if (config === null || typeof config !== "object") return false;
+  const record = config as Readonly<Record<string, unknown>>;
+  const commandPath = typeof record.commandPath === "string" ? record.commandPath.trim() : "";
+  if (commandPath.length > 0) {
+    const basename = executableBasename(commandPath);
+    if (DSH_BINARY_NAME.test(basename) || DSH_DESKTOP_EXE_NAME.test(basename)) return true;
+  }
+  const commandArgs = record.commandArgs;
+  if (!Array.isArray(commandArgs)) return false;
+  return commandArgs.some((arg) => typeof arg === "string" && DSH_ENTRYPOINT_ARG.test(arg));
+}
+
 function applyProviderInstanceBranding(
   entry: ProviderInstanceEntry,
   settings: Pick<ServerSettings, "providerInstances">,
@@ -171,7 +196,11 @@ function applyProviderInstanceBranding(
       ? (explicitInstance.config as Readonly<Record<string, unknown>>)
       : null;
   if (config?.source === "local") {
-    return { ...entry, acpRegistryAgentId: undefined, acpRegistryIconUrl: undefined };
+    return {
+      ...entry,
+      acpRegistryAgentId: isDeepSeekHarnessAcpConfig(config) ? "deepseek-harness" : undefined,
+      acpRegistryIconUrl: undefined,
+    };
   }
   const agentId = config?.agentId;
   const iconUrl = config?.registryIconUrl;

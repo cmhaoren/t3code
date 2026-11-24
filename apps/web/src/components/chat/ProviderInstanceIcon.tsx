@@ -11,6 +11,7 @@ import {
   AnthropicIcon,
   AntigravityIcon,
   ClaudeAI,
+  DeepSeekIcon,
   Icon,
   OllamaIcon,
   OpenAI,
@@ -74,16 +75,22 @@ export function providerTextColor(driverKind: ProviderDriverKind): {
   return className ? { className } : {};
 }
 
+const DSH_AGENT_ID = /^(?:deepseek-harness|dsh)$/iu;
+
+function isDeepSeekHarnessAgentId(agentId: string | undefined): boolean {
+  return typeof agentId === "string" && DSH_AGENT_ID.test(agentId.trim());
+}
+
 export function resolveProviderInstanceAcpRegistryIconUrl(input: {
   readonly driverKind: ProviderDriverKind;
   readonly agentId?: string | undefined;
   readonly iconUrl?: string | undefined;
 }): string | null {
   if (input.driverKind !== "acpRegistry") return null;
-  return (
-    resolveOfficialAcpRegistryIconUrl(input.iconUrl ?? null) ??
-    officialAcpRegistryIconUrlForAgentId(input.agentId?.trim() || null)
-  );
+  const explicitUrl = resolveOfficialAcpRegistryIconUrl(input.iconUrl ?? null);
+  if (explicitUrl !== null) return explicitUrl;
+  if (isDeepSeekHarnessAgentId(input.agentId)) return null;
+  return officialAcpRegistryIconUrlForAgentId(input.agentId?.trim() || null);
 }
 
 export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
@@ -120,6 +127,10 @@ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
     agentId: props.acpRegistryAgentId,
     iconUrl: props.acpRegistryIconUrl,
   });
+  const isDeepSeekHarness =
+    isAcpRegistry &&
+    acpRegistryIconUrl === null &&
+    isDeepSeekHarnessAgentId(props.acpRegistryAgentId);
 
   return (
     <span
@@ -130,7 +141,9 @@ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
       style={accentStyle}
       data-provider-accent-color={accentColor}
     >
-      {isAcpRegistry ? (
+      {isDeepSeekHarness ? (
+        <DeepSeekIcon className={cn("size-5 shrink-0", iconClassName)} aria-hidden />
+      ) : isAcpRegistry ? (
         <AcpRegistryAgentIcon
           className={cn("size-5 rounded-none bg-transparent", iconClassName)}
           fallbackClassName="size-full"

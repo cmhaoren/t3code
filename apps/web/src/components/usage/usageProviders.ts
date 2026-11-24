@@ -8,6 +8,7 @@ type UsageProviderPresentation = {
   readonly label: string;
   readonly color: string;
   readonly driverKind: ProviderDriverKind;
+  readonly acpRegistryAgentId?: string;
 };
 
 export const PROVIDER_PRESENTATION = {
@@ -52,6 +53,7 @@ export const PROVIDER_PRESENTATION = {
     label: "DeepSeek Harness",
     color: "#4d6bfe",
     driverKind: ProviderDriverKind.make("acpRegistry"),
+    acpRegistryAgentId: "deepseek-harness",
   },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 

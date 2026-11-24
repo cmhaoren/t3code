@@ -1102,6 +1102,9 @@ function ProviderMark({
     <ProviderInstanceIcon
       driverKind={presentation.driverKind}
       displayName={presentation.label}
+      {...("acpRegistryAgentId" in presentation && presentation.acpRegistryAgentId !== undefined
+        ? { acpRegistryAgentId: presentation.acpRegistryAgentId }
+        : {})}
       iconClassName={className}
     />
   );
