@@ -2305,13 +2305,18 @@ export const layer: Layer.Layer<
               }),
         ),
       );
+      const needsTeamOrchestrationDelivery =
+        projection.thread.lineage.parentThreadId === null &&
+        (projection.thread.teamOrchestration?.enabled === true ||
+          deliveredTeamOrchestrationByProviderThread.has(runningProviderThread.id));
       const deliverySession =
         effectiveHandoffs.length === 0 &&
         retryHandoff.handoffs.length === 0 &&
         retryHandoff.attachments.length === 0 &&
         sideChatHandoff === undefined &&
         restartNote === "" &&
-        !noteContinuation
+        !noteContinuation &&
+        !needsTeamOrchestrationDelivery
           ? session
           : makeDeliverySession(session, startWithHandoffs);
       return runExecution.startRootRun({

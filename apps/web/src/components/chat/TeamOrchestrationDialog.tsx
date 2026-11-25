@@ -462,6 +462,7 @@ function TeamOrchestrationDialogContent(props: TeamOrchestrationDialogProps) {
     const prompt = buildTeamOrchestrationRetroPrompt({
       config: draft,
       ...(userCardsDir ? { userCardsDir } : {}),
+      cards,
     });
     onInsertRetroPrompt(prompt);
     onOpenChange(false);

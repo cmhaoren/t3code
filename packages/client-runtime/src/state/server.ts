@@ -1798,6 +1798,14 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => `${environmentId}:${input.instanceId}`,
       },
     }),
+    getSkillsOverview: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:skills-overview",
+      tag: WS_METHODS.serverGetSkillsOverview,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => `${environmentId}:${input.cwd ?? ""}`,
+      },
+    }),
     uninstallAcpRegistryManagedBinary: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:acp-registry:uninstall-managed-binary",
       tag: WS_METHODS.serverUninstallAcpRegistryManagedBinary,

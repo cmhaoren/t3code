@@ -107,6 +107,7 @@ import { useSecretSources } from "./SecretSourceInput";
 import { TextGeneratorsSettings } from "./TextGeneratorsSettings";
 import { UsageProviderSettings } from "./UsageProviderSettings";
 import { ProviderRuntimeMaintenanceSection } from "./ProviderRuntimeMaintenanceSection";
+import { SkillsMatrixSection } from "./SkillsMatrixSection";
 import { ProviderSetupSection, readAntigravityAuthMethod } from "./ProviderSetupSection";
 import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
 import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
@@ -1318,6 +1319,8 @@ export function EnvironmentProviderSettings({
           </div>
         </SettingsGroup>
       </SettingsSection>
+
+      <SkillsMatrixSection key={`skills-matrix:${environmentId}`} environmentId={environmentId} />
 
       <ProviderRuntimeMaintenanceSection
         key={`provider-runtimes:${environmentId}`}

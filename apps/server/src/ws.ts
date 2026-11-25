@@ -27,8 +27,10 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { rpcInitialItems } from "./rpcInitialItems.ts";
 import { subscribeChatGptHandoff } from "./provider/CodexChatGptHandoff.ts";
+import { buildSkillsOverview } from "./provider/skillsOverview.ts";
 import {
   AcpRegistryOperationError,
+  SkillsOverviewError,
   CommandId,
   authScopeResponse,
   AuthAccessStreamError,
@@ -2507,6 +2509,22 @@ export const layerWsRpc = (
             return yield* manager.probeModelOptions({
               ...(project === null ? {} : { cwd: project.workspaceRoot }),
               modelIds: input.modelIds,
+            });
+          },
+        ),
+        [WS_METHODS.serverGetSkillsOverview]: Effect.fn("WsServer.getSkillsOverview")(
+          function* (input) {
+            const [providers, settings] = yield* Effect.all([
+              providerRegistry.getProviders,
+              serverSettings.getSettings.pipe(
+                Effect.mapError((error) => new SkillsOverviewError({ message: error.message })),
+              ),
+            ]);
+            return yield* buildSkillsOverview({
+              providers,
+              settings,
+              stateDir: config.stateDir,
+              ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
             });
           },
         ),

@@ -167,9 +167,13 @@ describe("teamOrchestration", () => {
     const retro = buildTeamOrchestrationRetroPrompt({
       config: preset.config,
       userCardsDir: "C:/Users/demo/.t3/userdata/orchestration/cards",
+      cards: createDefaultTeamNormCards(),
     });
     expect(retro).toContain("review.blast-radius");
     expect(retro).toContain("C:/Users/demo/.t3/userdata/orchestration/cards");
+    expect(retro).toContain("<active_norm_cards>");
+    expect(retro).toContain("### `implementer.subagent`");
+    expect(retro).toContain("逐项判据");
   });
 
   it("properly JSON-escapes composite model ids, includes anti-compaction note, infers stage from role, and collects pinned models", () => {

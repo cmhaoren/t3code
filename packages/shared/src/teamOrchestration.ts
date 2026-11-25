@@ -120,7 +120,7 @@ export const BUILTIN_TEAM_NORM_CARDS: ReadonlyArray<TeamNormCardDefinition> = [
     title: "方案官 · 指挥官自规划",
     description: "主会话基于一手源码直接产出精炼可执行方案",
     defaultContent: [
-      "- 规划前先定位真实代码接缝、公共契约与现有模式，避免拍脑袋设计。",
+      "- 规划前先定位真实代码接缝、公共契约与现有模式；写进任务书的前提须先用一手源码核实，未核实的标「待核」。",
       "- 输出聚焦的实施清单：模块边界、关键数据结构/接口、边界条件与客观验证方式。",
     ].join("\n"),
   },
@@ -163,9 +163,9 @@ export const BUILTIN_TEAM_NORM_CARDS: ReadonlyArray<TeamNormCardDefinition> = [
     description: "指挥官拆解任务并按复杂度委派子代理，严格控白名单与亲自复核",
     defaultContent: [
       "- 委派前先解耦任务，单次委派尽量控制在 ≤10 个文件、单一清晰阶段。",
-      '- 调用 `delegate_task` 时传 `orchestrationStage: "implement"`、`role: "implementation"`，并在任务书明确：可写文件白名单、关键公式/跨包导出口径、必跑验收命令，以及要求在最后一条回复自包含列出改动文件与实跑结果。',
+      '- 调用 `delegate_task` 时传 `orchestrationStage: "implement"`、`role: "implementation"`，并在任务书明确：可写文件白名单、关键公式/跨包导出口径、必跑验收命令及逐项判据（每个可见要求一条定点断言，不以全局平均/总分作通过标准），以及要求在最后一条回复自包含列出改动文件与实跑结果。',
       '- 并行委派多个执行子代理时，若采用共享目录（`isolation: "shared"`）必须确保白名单互不重叠；若存在文件交叉、分支隔离或独立构建风险，使用 `isolation: "worktree"`。',
-      "- 子代理完成后，指挥官必须亲自复核 git diff、跨字段口径与关键测试，不只听子代理口头汇报。",
+      "- 子代理完成后，指挥官必须亲自复核 git diff、跨字段口径与关键测试；子代理标为「残留/非缺陷/未复现」的项逐条抽核。",
     ].join("\n"),
   },
   {
@@ -174,8 +174,9 @@ export const BUILTIN_TEAM_NORM_CARDS: ReadonlyArray<TeamNormCardDefinition> = [
     title: "审核官 · 指挥官审核",
     description: "主会话切入独立审视视角通读最终 diff 并核对证据",
     defaultContent: [
-      "- 落地完成后切入独立审视者视角，完整通读 `git diff` 与新增测试。",
+      "- 落地完成后完整通读 `git diff` 与新增测试；截图、日志等一次性证据看完一份当场写下结论。",
       "- 对照原始需求、边界条件与回归面逐项核验，发现问题直接修复并重跑验证。",
+      "- 改动触及共享层（公共组件/契约/运行时库）或越出白名单时，补派 `review.blast-radius` 单维审核。",
     ].join("\n"),
   },
   {
@@ -872,17 +873,61 @@ export function summarizeTeamOrchestrationBadge(
   return parts.join(" · ");
 }
 
+function collectActiveTeamNormCardIds(
+  config: TeamOrchestrationConfig,
+): ReadonlyArray<TeamNormCardId> {
+  const ids: Array<TeamNormCardId> = [
+    config.commanderMode === "grill" ? "commander.grill" : "commander.autonomous",
+  ];
+  if (config.planner.mode === "commander") ids.push("planner.commander");
+  else if (config.planner.mode === "single") ids.push("planner.single");
+  else if (config.planner.mode === "panel") ids.push("planner.panel");
+  else ids.push("planner.commander", "planner.single");
+
+  if (config.implementer.mode === "direct") ids.push("implementer.direct");
+  else if (config.implementer.mode === "subagent") ids.push("implementer.subagent");
+  else ids.push("implementer.direct", "implementer.subagent");
+
+  if (config.reviewer.mode === "commander") ids.push("reviewer.commander");
+  else if (config.reviewer.mode === "multi") ids.push("reviewer.multi");
+  else ids.push("reviewer.commander", "reviewer.multi");
+
+  for (const angle of config.reviewer.angles) {
+    ids.push(TEAM_REVIEW_ANGLE_BY_ID[angle].cardId);
+  }
+  if (config.baseline.tdd) ids.push("baseline.tdd");
+  if (config.baseline.realEvidence) ids.push("baseline.real-evidence");
+  if (config.baseline.separateReview) ids.push("baseline.separate-review");
+  return [...new Set(ids)];
+}
+
 export function buildTeamOrchestrationRetroPrompt(input: {
   readonly config: TeamOrchestrationConfig;
   readonly userCardsDir?: string;
+  readonly cards?: ReadonlyArray<Pick<TeamNormCard, "id" | "title" | "source" | "content">>;
 }): string {
   const activeAngles =
     input.config.reviewer.angles.length > 0
       ? input.config.reviewer.angles.map((id) => `\`review.${id}\``).join("、")
       : "默认维度";
   const dirNote = input.userCardsDir
-    ? `规范卡片目录位于 \`${input.userCardsDir}\`（每张卡片对应 \`<cardId>.md\`）。`
+    ? `用户级规范卡片覆写目录位于 \`${input.userCardsDir}\`（每张卡片对应 \`<cardId>.md\`，未自定义前该目录可能尚未创建；确认后直接建目录并写入对应 \`<cardId>.md\` 即可热生效，无需改源码）。`
     : "规范卡片可在编排面板的「规范卡片库」中直接保存。";
+
+  const activeIds = collectActiveTeamNormCardIds(input.config);
+  const cardById = new Map((input.cards ?? []).map((card) => [card.id, card]));
+  const cardSnapshots = activeIds.map((cardId) => {
+    const loaded = cardById.get(cardId);
+    const def = BUILTIN_TEAM_NORM_CARD_MAP[cardId];
+    const sourceLabel =
+      loaded?.source === "project"
+        ? "项目覆写"
+        : loaded?.source === "user"
+          ? "用户覆写"
+          : "内置默认";
+    const content = loaded?.content?.trim() || def.defaultContent;
+    return `### \`${cardId}\`（${def.title}｜${sourceLabel}）\n${content}`;
+  });
 
   return [
     "请对本次会话的团队编排执行一次精炼复盘（Retro）：",
@@ -894,5 +939,9 @@ export function buildTeamOrchestrationRetroPrompt(input: {
       "）。",
     "3. 给出每条拟改卡片的「原句 / 拟改内容 / 原因」（保持简短、高信噪比，优先删改而非无限叠加），先列出来等我确认后再修改。",
     dirNote,
+    "",
+    "<active_norm_cards>",
+    ...cardSnapshots,
+    "</active_norm_cards>",
   ].join("\n");
 }

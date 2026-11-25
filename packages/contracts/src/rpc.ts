@@ -486,6 +486,11 @@ import {
   OrchestrationCardsResetInput,
   OrchestrationCardsSaveInput,
 } from "./teamOrchestration.ts";
+import {
+  ServerGetSkillsOverviewInput,
+  ServerGetSkillsOverviewResult,
+  SkillsOverviewError,
+} from "./skillsOverview.ts";
 
 export const WS_METHODS = {
   projectsListEntries: "projects.listEntries",
@@ -615,6 +620,7 @@ export const WS_METHODS = {
   serverSearchAcpRegistry: "server.searchAcpRegistry",
   serverPrepareAcpRegistryAgent: "server.prepareAcpRegistryAgent",
   serverProbeAcpModelOptions: "server.probeAcpModelOptions",
+  serverGetSkillsOverview: "server.getSkillsOverview",
   serverUninstallAcpRegistryManagedBinary: "server.uninstallAcpRegistryManagedBinary",
   serverAcceptAcpRegistryUrlAuth: "server.acceptAcpRegistryUrlAuth",
   serverListAcpRegistrySessions: "server.listAcpRegistrySessions",
@@ -1057,6 +1063,12 @@ const WsServerProbeAcpModelOptionsRpc = Rpc.make(WS_METHODS.serverProbeAcpModelO
   payload: AcpRegistryProbeModelOptionsInput,
   success: AcpRegistryProbeModelOptionsResult,
   error: Schema.Union([AcpRegistryOperationError, EnvironmentAuthorizationError]),
+});
+
+const WsServerGetSkillsOverviewRpc = Rpc.make(WS_METHODS.serverGetSkillsOverview, {
+  payload: ServerGetSkillsOverviewInput,
+  success: ServerGetSkillsOverviewResult,
+  error: Schema.Union([SkillsOverviewError, EnvironmentAuthorizationError]),
 });
 
 const WsServerUninstallAcpRegistryManagedBinaryRpc = Rpc.make(
@@ -2529,6 +2541,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerSearchAcpRegistryRpc,
   WsServerPrepareAcpRegistryAgentRpc,
   WsServerProbeAcpModelOptionsRpc,
+  WsServerGetSkillsOverviewRpc,
   WsServerUninstallAcpRegistryManagedBinaryRpc,
   WsServerAcceptAcpRegistryUrlAuthRpc,
   WsServerListAcpRegistrySessionsRpc,
