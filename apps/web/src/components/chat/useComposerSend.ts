@@ -3,6 +3,11 @@ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { m } from "~/i18n/messages";
 import { isClearComposerCommand, parseSideChatCommand } from "@t3tools/shared/composerTrigger";
 import { readWorktreeBaseBranch } from "../../worktreeRepositoryChoiceStore";
+import {
+  resolveDraftTeamOrchestrationConfig,
+  teamOrchestrationDraftKey,
+  useTeamOrchestrationDraftStore,
+} from "../../teamOrchestrationDraftStore";
 import { armFreshSession, disarmFreshSession, readFreshSessionArm } from "./freshSessionArms";
 import {
   mergeDirectPreviewAnnotation,
@@ -1497,6 +1502,12 @@ export function useComposerSend(input: ComposerSendInput) {
     let backgroundDraftOpened = false;
     let turnStartSucceeded = false;
     if (failure === null && turnAttachmentsResult._tag === "Success") {
+      const draftTeamOrchestration = isLocalDraftThread
+        ? resolveDraftTeamOrchestrationConfig(
+            draftId,
+            readEnvironmentPresentation(environmentId)?.serverConfig?.settings,
+          )
+        : null;
       const bootstrap =
         isLocalDraftThread || baseBranchForWorktree
           ? {
@@ -1508,6 +1519,9 @@ export function useComposerSend(input: ComposerSendInput) {
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,
                       interactionMode: DEFAULT_INTERACTION_MODE,
+                      ...(draftTeamOrchestration
+                        ? { teamOrchestration: draftTeamOrchestration }
+                        : {}),
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
                       createdAt: activeThread.createdAt,
@@ -1637,6 +1651,12 @@ export function useComposerSend(input: ComposerSendInput) {
           handleNewThreadInActiveProject();
         }
         void recordPromptSent(environmentId);
+        if (isLocalDraftThread && draftId) {
+          const draftKey = teamOrchestrationDraftKey(draftId);
+          if (draftKey) {
+            useTeamOrchestrationDraftStore.getState().clearDraftConfig(draftKey);
+          }
+        }
       }
     }
 

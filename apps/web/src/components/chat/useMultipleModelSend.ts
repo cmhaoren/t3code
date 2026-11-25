@@ -25,6 +25,12 @@ import { releaseDraftAttachments } from "../../lib/attachmentUploadQueue";
 import type { buildMessageContext } from "../../lib/composerContextRecords";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { threadEnvironment } from "../../state/threads";
+import { serverEnvironment } from "../../state/server";
+import {
+  resolveDraftTeamOrchestrationConfig,
+  teamOrchestrationDraftKey,
+  useTeamOrchestrationDraftStore,
+} from "../../teamOrchestrationDraftStore";
 import { useOrchestrationCommand } from "../../state/use-orchestration-command";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { DEFAULT_INTERACTION_MODE } from "../../types";
@@ -196,6 +202,14 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
                       modelSelection: target.selection,
                       runtimeMode,
                       interactionMode: DEFAULT_INTERACTION_MODE,
+                      ...(() => {
+                        const draftConfig = resolveDraftTeamOrchestrationConfig(
+                          draftId,
+                          appAtomRegistry.get(serverEnvironment.configValueAtom(environmentId))
+                            ?.settings,
+                        );
+                        return draftConfig ? { teamOrchestration: draftConfig } : {};
+                      })(),
                       branch,
                       worktreePath: null,
                       createdAt: createdAt,
@@ -228,6 +242,12 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
       releasedComposer = true;
       await starts;
       if (startedCount > 0) {
+        if (draftId) {
+          const draftKey = teamOrchestrationDraftKey(draftId);
+          if (draftKey) {
+            useTeamOrchestrationDraftStore.getState().clearDraftConfig(draftKey);
+          }
+        }
         toastManager.add(
           stackedThreadToast({
             type: "success",

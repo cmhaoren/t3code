@@ -3,7 +3,7 @@ import type { PromptUltrathink } from "./TraitsPicker";
 import type { ProviderInstanceEntry } from "../../providerInstances";
 import { type AppModelOption } from "../../modelSelection";
 import { useGT, useMessages } from "gt-react";
-import { CircleAlertIcon } from "lucide-react";
+import { CircleAlertIcon, UsersIcon } from "lucide-react";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerControl } from "./ComposerControl";
 import {
@@ -18,7 +18,9 @@ import {
   type ProviderInstanceId,
   type RuntimeMode,
   type ServerProvider,
+  type TeamOrchestrationConfig,
 } from "@t3tools/contracts";
+import { summarizeTeamOrchestrationBadge } from "@t3tools/shared/teamOrchestration";
 import type { EffortDisplay } from "@t3tools/contracts/settings";
 import { cn } from "~/lib/utils";
 import { resolveComposerTraitsInput } from "./composerProviderState";
@@ -87,6 +89,8 @@ export function ComposerControlsBar(props: {
   onModelPickerOpenChange: (open: boolean) => void;
   modelPickerIconClassName: string | undefined;
   getModelDisabledReason: ChatComposerProps["getModelDisabledReason"];
+  teamOrchestration?: TeamOrchestrationConfig | null;
+  onOpenTeamOrchestration?: () => void;
 }) {
   const {
     environmentId,
@@ -131,7 +135,10 @@ export function ComposerControlsBar(props: {
     onModelPickerOpenChange,
     modelPickerIconClassName,
     getModelDisabledReason,
+    teamOrchestration,
+    onOpenTeamOrchestration,
   } = props;
+  const teamOrchestrationBadge = summarizeTeamOrchestrationBadge(teamOrchestration);
   const accessMatchesDefault = compatibleRuntimeMode === defaultRuntimeMode;
   const {
     accessDisplay,
@@ -266,6 +273,32 @@ export function ComposerControlsBar(props: {
   ) : (
     <>
       {composerModelPicker}
+
+      {onOpenTeamOrchestration ? (
+        <ComposerControl
+          type="button"
+          size={controlSize}
+          disabled={isSendBusy}
+          onClick={onOpenTeamOrchestration}
+          data-chat-team-orchestration-trigger="true"
+          aria-label={
+            teamOrchestrationBadge
+              ? gt("团队编排已开启：{badge}", { badge: teamOrchestrationBadge })
+              : gt("配置本会话的多 Agent 团队编排")
+          }
+          className={cn(
+            "shrink-0 gap-1.5",
+            teamOrchestrationBadge
+              ? "border border-primary/30 bg-primary/12 text-primary hover:bg-primary/18 hover:text-primary"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          <UsersIcon className="size-3.5 shrink-0" />
+          <span data-composer-control-label className="max-w-[160px] truncate">
+            {teamOrchestrationBadge ?? gt("编排")}
+          </span>
+        </ComposerControl>
+      ) : null}
 
       <>
         {restingBlockDefs.map((def, index) => {

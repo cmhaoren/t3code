@@ -3758,6 +3758,54 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         DateTime.toEpochMillis(untaggedShell.updatedAt),
       );
 
+      yield* orchestrator.dispatch({
+        type: "thread.team-orchestration.set",
+        commandId: CommandId.make("runtime-layer-lifecycle-team-orchestration-set"),
+        threadId,
+        teamOrchestration: {
+          version: 1,
+          enabled: true,
+          presetId: "builtin-deep-craft",
+          commanderMode: "grill",
+          planner: { mode: "commander", modelSelection: null, panelModels: [] },
+          implementer: {
+            mode: "subagent",
+            isolation: "shared",
+            routineModel: null,
+            standardModel: null,
+            complexModel: null,
+          },
+          reviewer: {
+            mode: "multi",
+            defaultModel: null,
+            angles: ["correctness", "blast-radius"],
+            angleModelOverrides: {},
+          },
+          baseline: {
+            tdd: true,
+            realEvidence: true,
+            separateReview: true,
+            maxReworkBeforeRethink: 2,
+          },
+          notes: "roundtrip test",
+        },
+      });
+      const orchestratedShell = shellOf(yield* orchestrator.getShellSnapshot());
+      assert.equal(orchestratedShell.teamOrchestration?.enabled, true);
+      assert.deepEqual(orchestratedShell.teamOrchestration?.reviewer.angles, [
+        "correctness",
+        "blast-radius",
+      ]);
+      const orchestratedProjection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(orchestratedProjection.thread.teamOrchestration?.notes, "roundtrip test");
+      yield* orchestrator.dispatch({
+        type: "thread.team-orchestration.set",
+        commandId: CommandId.make("runtime-layer-lifecycle-team-orchestration-clear"),
+        threadId,
+        teamOrchestration: null,
+      });
+      assert.equal(shellOf(yield* orchestrator.getShellSnapshot()).teamOrchestration, null);
+
       const preAutoProjection = yield* orchestrator.getThreadProjection(threadId);
       const staleAutoSettle = yield* orchestrator
         .dispatch({

@@ -1938,6 +1938,22 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: configScheduler,
       concurrency: configConcurrency,
     }),
+    listOrchestrationCards: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:orchestration-cards:list",
+      tag: WS_METHODS.orchestrationCardsList,
+    }),
+    saveOrchestrationCard: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:orchestration-cards:save",
+      tag: WS_METHODS.orchestrationCardsSave,
+      scheduler: configScheduler,
+      concurrency: configConcurrency,
+    }),
+    resetOrchestrationCard: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:orchestration-cards:reset",
+      tag: WS_METHODS.orchestrationCardsReset,
+      scheduler: configScheduler,
+      concurrency: configConcurrency,
+    }),
     createGuestShare: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:guest-share:create",
       tag: WS_METHODS.guestShareCreate,

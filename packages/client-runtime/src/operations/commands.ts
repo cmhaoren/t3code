@@ -167,6 +167,10 @@ export interface SetThreadInteractionModeInput extends ThreadCommandInput {
   readonly interactionMode: ProviderInteractionMode;
 }
 
+export interface SetThreadTeamOrchestrationInput extends ThreadCommandInput {
+  readonly teamOrchestration: import("@t3tools/contracts").TeamOrchestrationConfig | null;
+}
+
 interface StartThreadBootstrap {
   readonly createThread?: {
     readonly projectId: ProjectId;
@@ -174,6 +178,7 @@ interface StartThreadBootstrap {
     readonly modelSelection: ModelSelection;
     readonly runtimeMode: RuntimeMode;
     readonly interactionMode: ProviderInteractionMode;
+    readonly teamOrchestration?: import("@t3tools/contracts").TeamOrchestrationConfig | null;
     readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly createdAt: string;
@@ -774,6 +779,17 @@ export const setThreadInteractionMode = Effect.fn("EnvironmentCommands.setThread
   },
 );
 
+export const setThreadTeamOrchestration = Effect.fn(
+  "EnvironmentCommands.setThreadTeamOrchestration",
+)(function* (input: SetThreadTeamOrchestrationInput) {
+  return yield* dispatch({
+    type: "thread.team-orchestration.set",
+    commandId: yield* allocateCommandId(input),
+    threadId: input.threadId,
+    teamOrchestration: input.teamOrchestration,
+  });
+});
+
 // Servers without native resume dispatch command.text verbatim; newer ones clear
 // it when manualContinuationOfRunId is set.
 const MANUAL_CONTINUATION_FALLBACK_TEXT = "Continue where you left off.";
@@ -835,6 +851,9 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       modelSelection: input.modelSelection ?? thread.modelSelection,
       runtimeMode: input.runtimeMode,
       interactionMode: input.interactionMode,
+      ...(bootstrap?.teamOrchestration === undefined
+        ? {}
+        : { teamOrchestration: bootstrap.teamOrchestration }),
       workspaceStrategy,
       initialMessage: {
         messageId: input.message.messageId,

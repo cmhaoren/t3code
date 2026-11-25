@@ -43,6 +43,7 @@ import {
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
+import { TeamOrchestrationStage, TeamReviewAngleId } from "./teamOrchestration.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000));
@@ -176,6 +177,18 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   ),
   title: Schema.optional(OrchestratorMcpTitle),
   role: Schema.optional(OrchestratorMcpTaskRole),
+  orchestrationStage: Schema.optional(
+    TeamOrchestrationStage.annotate({
+      description:
+        "Optional team orchestration stage ('plan', 'implement', or 'review') to prepend its active norm card to the child task.",
+    }),
+  ),
+  reviewAngle: Schema.optional(
+    TeamReviewAngleId.annotate({
+      description:
+        "Optional review angle id (e.g. 'correctness', 'blast-radius', 'spec-alignment') when delegating a multi-dimensional review task.",
+    }),
+  ),
   isolation: Schema.optional(
     Schema.Literals(["shared", "worktree"]).annotate({
       description:

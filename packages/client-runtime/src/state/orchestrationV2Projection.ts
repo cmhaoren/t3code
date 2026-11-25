@@ -317,6 +317,7 @@ export function applyOrchestrationV2ProjectionEvent(
     case "thread.issue-synced":
     case "thread.runtime-mode-updated":
     case "thread.interaction-mode-updated":
+    case "thread.team-orchestration-updated":
     case "thread.model-selection-updated":
     case "thread.provider-switched":
     case "thread.guest-share-updated":

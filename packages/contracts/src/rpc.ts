@@ -476,6 +476,14 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
+import {
+  OrchestrationCardsError,
+  OrchestrationCardsListInput,
+  OrchestrationCardsListResult,
+  OrchestrationCardsMutationResult,
+  OrchestrationCardsResetInput,
+  OrchestrationCardsSaveInput,
+} from "./teamOrchestration.ts";
 
 export const WS_METHODS = {
   projectsListEntries: "projects.listEntries",
@@ -637,6 +645,9 @@ export const WS_METHODS = {
   scheduledTasksDelete: "scheduledTasks.delete",
   scheduledTasksRunNow: "scheduledTasks.runNow",
   scheduledTasksRotateWebhookToken: "scheduledTasks.rotateWebhookToken",
+  orchestrationCardsList: "orchestrationCards.list",
+  orchestrationCardsSave: "orchestrationCards.save",
+  orchestrationCardsReset: "orchestrationCards.reset",
   secretsAnswerRequest: "secrets.answerRequest",
   guestShareCreate: "guestShare.create",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
@@ -2354,6 +2365,24 @@ const WsScheduledTasksUpsertRpc = Rpc.make(WS_METHODS.scheduledTasksUpsert, {
   error: Schema.Union([ScheduledTaskError, EnvironmentAuthorizationError]),
 });
 
+const WsOrchestrationCardsListRpc = Rpc.make(WS_METHODS.orchestrationCardsList, {
+  payload: OrchestrationCardsListInput,
+  success: OrchestrationCardsListResult,
+  error: Schema.Union([OrchestrationCardsError, EnvironmentAuthorizationError]),
+});
+
+const WsOrchestrationCardsSaveRpc = Rpc.make(WS_METHODS.orchestrationCardsSave, {
+  payload: OrchestrationCardsSaveInput,
+  success: OrchestrationCardsMutationResult,
+  error: Schema.Union([OrchestrationCardsError, EnvironmentAuthorizationError]),
+});
+
+const WsOrchestrationCardsResetRpc = Rpc.make(WS_METHODS.orchestrationCardsReset, {
+  payload: OrchestrationCardsResetInput,
+  success: OrchestrationCardsMutationResult,
+  error: Schema.Union([OrchestrationCardsError, EnvironmentAuthorizationError]),
+});
+
 const WsScheduledTasksSetEnabledRpc = Rpc.make(WS_METHODS.scheduledTasksSetEnabled, {
   payload: ScheduledTaskSetEnabledInput,
   success: ScheduledTaskMutationResult,
@@ -2521,6 +2550,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsScheduledTasksDeleteRpc,
   WsScheduledTasksRunNowRpc,
   WsScheduledTasksRotateWebhookTokenRpc,
+  WsOrchestrationCardsListRpc,
+  WsOrchestrationCardsSaveRpc,
+  WsOrchestrationCardsResetRpc,
   WsSecretsAnswerRequestRpc,
   WsScheduledTasksListWebhookDeliveriesRpc,
   WsScheduledTasksGetWebhookDeliveryRpc,

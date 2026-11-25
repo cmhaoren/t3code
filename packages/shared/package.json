@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./teamOrchestration": {
+      "types": "./src/teamOrchestration.ts",
+      "import": "./src/teamOrchestration.ts"
+    },
     "./png": {
       "types": "./src/png.ts",
       "import": "./src/png.ts"

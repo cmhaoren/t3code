@@ -300,6 +300,7 @@ import {
 } from "./preparingComposerImages";
 import { HELD_COMPOSER_SEND_BANNER_ID } from "./ComposerHeldSendBanner";
 import { ComposerControlsBar } from "./ComposerControlsBar";
+import { TeamOrchestrationDialog } from "./TeamOrchestrationDialog";
 import { composerCommandKeyHandler } from "./composerCommandKey";
 import { promptSuggestionToAccept, usePromptSuggestion } from "./usePromptSuggestion";
 import { useFreshSessionArmed } from "./freshSessionArms";
@@ -507,6 +508,10 @@ export interface ChatComposerProps {
   onOpenProviderSetup: (instanceId: ProviderInstanceId) => void;
   getModelDisabledReason: (instanceId: ProviderInstanceId, model: string) => string | null;
   handleRuntimeModeChange: (mode: RuntimeMode) => void;
+  teamOrchestration?: import("@t3tools/contracts").TeamOrchestrationConfig | null;
+  onTeamOrchestrationChange?: (
+    next: import("@t3tools/contracts").TeamOrchestrationConfig | null,
+  ) => Promise<void> | void;
 
   focusComposer: () => void;
   scheduleComposerFocus: () => void;
@@ -601,6 +606,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onOpenProviderSetup,
     getModelDisabledReason,
     handleRuntimeModeChange,
+    teamOrchestration,
+    onTeamOrchestrationChange,
     focusComposer,
     scheduleComposerFocus,
     setThreadError,
@@ -1067,6 +1074,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
+  const [isTeamOrchestrationDialogOpen, setIsTeamOrchestrationDialogOpen] = useState(false);
   const isMobileViewport = useMediaQuery("max-sm");
   const isSoftwareKeyboardOpen = useSoftwareKeyboardOpen();
   const [isComposerFocused, setIsComposerFocused] = useState(false);
@@ -2698,6 +2706,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       onModelPickerOpenChange={setIsComposerModelPickerOpen}
       modelPickerIconClassName={composerProviderState.modelPickerIconClassName}
       getModelDisabledReason={getModelDisabledReason}
+      teamOrchestration={teamOrchestration ?? null}
+      {...(onTeamOrchestrationChange
+        ? { onOpenTeamOrchestration: () => setIsTeamOrchestrationDialogOpen(true) }
+        : {})}
     />
   );
   // An open question owns the space above the composer. Only a machine problem,
@@ -4147,6 +4159,27 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           </div>
         </ComposerSurface.Main>
       </div>
+      {onTeamOrchestrationChange ? (
+        <TeamOrchestrationDialog
+          open={isTeamOrchestrationDialogOpen}
+          onOpenChange={setIsTeamOrchestrationDialogOpen}
+          environmentId={environmentId}
+          projectId={activeProjectId}
+          workspaceCwd={gitCwd}
+          isExistingThread={routeKind === "server"}
+          value={teamOrchestration ?? null}
+          fallbackSelection={selectedModelSelection}
+          instanceEntries={providerInstanceEntries}
+          modelOptionsByInstance={modelOptionsByInstance}
+          getModelDisabledReason={getModelDisabledReason}
+          onOpenProviderSetup={onOpenProviderSetup}
+          onApply={onTeamOrchestrationChange}
+          onInsertRetroPrompt={(retroPrompt) => {
+            setPrompt(retroPrompt);
+            scheduleComposerFocus();
+          }}
+        />
+      ) : null}
     </form>
   );
 });

@@ -23,6 +23,11 @@ import { usePullRequestDraftThread } from "./chat/usePullRequestDraftThread";
 import { usePullRequestLinking } from "../hooks/usePullRequestLinking";
 import { useComposerSelection } from "./chat/useComposerSelection";
 import { useComposerFocus } from "./chat/useComposerFocus";
+import {
+  resolveDraftTeamOrchestrationConfig,
+  teamOrchestrationDraftKey,
+  useTeamOrchestrationDraftStore,
+} from "../teamOrchestrationDraftStore";
 import { useProjectCloneBanner } from "./chat/useProjectCloneBanner";
 import { useAttachmentPreviewHandoff } from "./chat/useAttachmentPreviewHandoff";
 import {
@@ -495,6 +500,13 @@ export default function ChatView(props: ChatViewProps) {
   const setThreadInteractionMode = useOrchestrationCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
+  const setThreadTeamOrchestration = useOrchestrationCommand(
+    threadEnvironment.setTeamOrchestration,
+    {
+      reportFailure: false,
+    },
+  );
+  const teamOrchestrationDrafts = useTeamOrchestrationDraftStore((store) => store.byDraftKey);
   const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
@@ -3035,6 +3047,43 @@ export default function ChatView(props: ChatViewProps) {
     void sendStandaloneCommand("/compact", gt("Failed to compact context."));
   };
 
+  const isTopLevelOrchestrationThread =
+    routeKind === "draft" || (activeThread?.lineage.parentThreadId ?? null) === null;
+  const effectiveTeamOrchestration = isTopLevelOrchestrationThread
+    ? routeKind === "server"
+      ? (serverProjection?.thread.teamOrchestration ?? serverThreadShell?.teamOrchestration ?? null)
+      : resolveDraftTeamOrchestrationConfig(
+          draftId,
+          serverConfig?.settings,
+          teamOrchestrationDrafts,
+        )
+    : null;
+  const handleTeamOrchestrationChangeStable = useStableCallback(
+    async (next: import("@t3tools/contracts").TeamOrchestrationConfig | null) => {
+      if (routeKind === "draft") {
+        const key = teamOrchestrationDraftKey(draftId);
+        if (key) {
+          useTeamOrchestrationDraftStore.getState().setDraftConfig(key, next);
+        }
+        return;
+      }
+      if (!activeThreadId) return;
+      const result = await setThreadTeamOrchestration({
+        environmentId,
+        input: {
+          threadId: activeThreadId,
+          teamOrchestration: next,
+        },
+      });
+      if (result._tag === "Failure") {
+        toastManager.add({
+          type: "error",
+          title: gt("保存团队编排配置失败"),
+        });
+      }
+    },
+  );
+
   const {
     getModelDisabledReason,
     handleRuntimeModeChangeStable,
@@ -3950,6 +3999,13 @@ export default function ChatView(props: ChatViewProps) {
                                 onOpenProviderSetup={openProviderSetupStable}
                                 getModelDisabledReason={getModelDisabledReason}
                                 handleRuntimeModeChange={handleRuntimeModeChangeStable}
+                                teamOrchestration={effectiveTeamOrchestration}
+                                {...(isTopLevelOrchestrationThread
+                                  ? {
+                                      onTeamOrchestrationChange:
+                                        handleTeamOrchestrationChangeStable,
+                                    }
+                                  : {})}
                                 focusComposer={focusComposerStable}
                                 scheduleComposerFocus={scheduleComposerFocusStable}
                                 setThreadError={setThreadError}

@@ -121,6 +121,8 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { compileSubagentNormCardPrefix } from "@t3tools/shared/teamOrchestration";
+import { loadEffectiveTeamNormCardsOptional } from "../orchestration-v2/teamNormCardStore.ts";
 import {
   clientModeCeiling,
   type McpInvocationScope,
@@ -2917,6 +2919,24 @@ const make = Effect.gen(function* () {
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
       }
       const parentNodeId = parentRun.rootNodeId;
+      let resolvedTaskPrompt = taskPrompt(input);
+      if (input.orchestrationStage !== undefined || input.reviewAngle !== undefined) {
+        const parentProject = yield* projects
+          .getById(parent.thread.projectId)
+          .pipe(Effect.orElseSucceed(() => Option.none()));
+        const cards = yield* loadEffectiveTeamNormCardsOptional({
+          projectWorkspaceRoot: Option.getOrUndefined(parentProject)?.workspaceRoot ?? null,
+        });
+        const normPrefix = compileSubagentNormCardPrefix({
+          ...(input.orchestrationStage === undefined ? {} : { stage: input.orchestrationStage }),
+          ...(input.reviewAngle === undefined ? {} : { reviewAngle: input.reviewAngle }),
+          config: parent.thread.teamOrchestration ?? null,
+          cards,
+        });
+        if (normPrefix !== null) {
+          resolvedTaskPrompt = `${normPrefix}\n\n${resolvedTaskPrompt}`;
+        }
+      }
       // The command commits the child's preparing run, which only this call
       // prepares, so a caller that goes away must not stop it in between.
       return yield* Effect.uninterruptibleMask((restore) =>
@@ -2933,7 +2953,7 @@ const make = Effect.gen(function* () {
               parentThreadId: scope.thread.threadId,
               parentRunId: parentRun.id,
               parentNodeId,
-              task: taskPrompt(input),
+              task: resolvedTaskPrompt,
               ...(input.title === undefined ? {} : { title: input.title }),
               modelSelection: target.modelSelection,
               runtimeMode,

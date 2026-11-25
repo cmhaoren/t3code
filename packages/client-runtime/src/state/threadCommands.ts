@@ -45,6 +45,7 @@ import {
   dismissThreadUserInput,
   revertThreadCheckpoint,
   setThreadInteractionMode,
+  setThreadTeamOrchestration,
   setThreadRuntimeMode,
   pinThread,
   reorderPinnedThread,
@@ -347,6 +348,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     setInteractionMode: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:set-interaction-mode",
       execute: setThreadInteractionMode,
+      scheduler,
+      concurrency,
+    }),
+    setTeamOrchestration: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:set-team-orchestration",
+      execute: setThreadTeamOrchestration,
       scheduler,
       concurrency,
     }),

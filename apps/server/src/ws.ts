@@ -133,6 +133,11 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
+import {
+  listTeamNormCards,
+  resetTeamNormCard,
+  saveTeamNormCard,
+} from "./orchestration-v2/teamNormCardStore.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
 import {
@@ -2248,6 +2253,9 @@ export const layerWsRpc = (
                           modelSelection: input.modelSelection,
                           runtimeMode: input.runtimeMode,
                           interactionMode: input.interactionMode,
+                          ...(input.teamOrchestration === undefined
+                            ? {}
+                            : { teamOrchestration: input.teamOrchestration }),
                           workspaceStrategy: input.workspaceStrategy,
                           ...(input.initialMessage === undefined
                             ? {}
@@ -2397,6 +2405,55 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.rotateWebhookToken(input)),
           ),
+        [WS_METHODS.orchestrationCardsList]: Effect.fn("WsServer.orchestrationCardsList")(
+          function* (input) {
+            const projectWorkspaceRoot =
+              input.projectId === undefined
+                ? null
+                : yield* projectService.getShell(input.projectId).pipe(
+                    Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot ?? null),
+                    Effect.orElseSucceed(() => null),
+                  );
+            return yield* listTeamNormCards({ projectWorkspaceRoot }).pipe(
+              Effect.provideService(ServerConfig.ServerConfig, config),
+            );
+          },
+        ),
+        [WS_METHODS.orchestrationCardsSave]: Effect.fn("WsServer.orchestrationCardsSave")(
+          function* (input) {
+            const projectWorkspaceRoot =
+              input.projectId === undefined
+                ? null
+                : yield* projectService.getShell(input.projectId).pipe(
+                    Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot ?? null),
+                    Effect.orElseSucceed(() => null),
+                  );
+            const card = yield* saveTeamNormCard({
+              cardId: input.cardId,
+              content: input.content,
+              ...(input.scope === undefined ? {} : { scope: input.scope }),
+              projectWorkspaceRoot,
+            }).pipe(Effect.provideService(ServerConfig.ServerConfig, config));
+            return { card };
+          },
+        ),
+        [WS_METHODS.orchestrationCardsReset]: Effect.fn("WsServer.orchestrationCardsReset")(
+          function* (input) {
+            const projectWorkspaceRoot =
+              input.projectId === undefined
+                ? null
+                : yield* projectService.getShell(input.projectId).pipe(
+                    Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot ?? null),
+                    Effect.orElseSucceed(() => null),
+                  );
+            const card = yield* resetTeamNormCard({
+              cardId: input.cardId,
+              ...(input.scope === undefined ? {} : { scope: input.scope }),
+              projectWorkspaceRoot,
+            }).pipe(Effect.provideService(ServerConfig.ServerConfig, config));
+            return { card };
+          },
+        ),
         [WS_METHODS.guestShareCreate]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
             Effect.andThen(guestShares.create(input)),

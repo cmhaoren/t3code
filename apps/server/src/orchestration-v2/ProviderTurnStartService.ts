@@ -1,5 +1,11 @@
 import { classifyCodexManagedError } from "../provider/CodexManagedErrors.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import {
+  compileTeamOrchestrationDeactivatedNotice,
+  compileTeamOrchestrationInstructions,
+  computeTeamOrchestrationFingerprint,
+} from "@t3tools/shared/teamOrchestration";
+import { loadEffectiveTeamNormCards } from "./teamNormCardStore.ts";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import { expandAssistantCitationsForProvider } from "@t3tools/shared/assistantCitations";
 import {
@@ -285,6 +291,8 @@ export const layer: Layer.Layer<
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const serverConfig = yield* ServerConfig.ServerConfig;
+    const serverSettings = yield* ServerSettings.ServerSettingsService;
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
@@ -293,6 +301,7 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+    const deliveredTeamOrchestrationByProviderThread = new Map<string, string | null>();
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
     const makeRunControls = (input: {
@@ -2065,11 +2074,70 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
+          if (compact) {
+            deliveredTeamOrchestrationByProviderThread.delete(runningProviderThread.id);
+          }
           // Like history, the side chat context waits for a turn that sends a prompt.
           const sideChatContext =
             sideChatHandoff === undefined || compact || goalCommand
               ? ""
               : sideChatHandoff.summaryText;
+          let teamOrchestrationContext = "";
+          let pendingTeamOrchestrationFingerprint: string | null | undefined = undefined;
+          if (
+            projection.thread.lineage.parentThreadId === null &&
+            !compact &&
+            !goalCommand &&
+            !isProviderCommand(providerMessage) &&
+            !noteContinuation
+          ) {
+            const previousFingerprint = deliveredTeamOrchestrationByProviderThread.get(
+              runningProviderThread.id,
+            );
+            const teamConfig = projection.thread.teamOrchestration;
+            if (teamConfig?.enabled) {
+              const projectWorkspaceRoot = yield* projects
+                .getById(projection.thread.projectId)
+                .pipe(
+                  Effect.map((opt) => Option.getOrUndefined(opt)?.workspaceRoot ?? null),
+                  Effect.orElseSucceed(() => null),
+                );
+              const cards = yield* loadEffectiveTeamNormCards({ projectWorkspaceRoot }).pipe(
+                Effect.provideService(ServerConfig.ServerConfig, serverConfig),
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, path),
+                Effect.orElseSucceed(() => []),
+              );
+              const providerLabelByInstanceId = yield* serverSettings.getSettings.pipe(
+                Effect.map((settings) => {
+                  const labels = new Map<string, string>();
+                  for (const [instanceId, instanceConfig] of Object.entries(
+                    settings.providerInstances,
+                  )) {
+                    const candidate = (instanceConfig as { readonly name?: unknown }).name;
+                    if (typeof candidate === "string" && candidate.trim().length > 0) {
+                      labels.set(instanceId, candidate.trim());
+                    }
+                  }
+                  return labels;
+                }),
+                Effect.orElseSucceed(() => new Map<string, string>()),
+              );
+              const compiled = compileTeamOrchestrationInstructions({
+                config: teamConfig,
+                cards,
+                providerLabelByInstanceId,
+              });
+              const fingerprint = computeTeamOrchestrationFingerprint(compiled);
+              if (compiled !== null && fingerprint !== previousFingerprint) {
+                teamOrchestrationContext = compiled;
+                pendingTeamOrchestrationFingerprint = fingerprint;
+              }
+            } else if (previousFingerprint !== undefined && previousFingerprint !== null) {
+              teamOrchestrationContext = compileTeamOrchestrationDeactivatedNotice();
+              pendingTeamOrchestrationFingerprint = null;
+            }
+          }
           // Record inline handoffs before startTurn so an immediate dropped terminal can restore them.
           inlineDeliveredHandoffs = [
             ...delivery.inlineHandoffs.map((handoff) =>
@@ -2079,7 +2147,7 @@ export const layer: Layer.Layer<
             ),
             ...(sideChatContext === "" || sideChatHandoff === undefined ? [] : [sideChatHandoff]),
           ];
-          const context = [delivery.context, sideChatContext, restartNote]
+          const context = [delivery.context, sideChatContext, restartNote, teamOrchestrationContext]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
@@ -2129,6 +2197,12 @@ export const layer: Layer.Layer<
                 : Effect.void,
             ),
           );
+          if (pendingTeamOrchestrationFingerprint !== undefined) {
+            deliveredTeamOrchestrationByProviderThread.set(
+              runningProviderThread.id,
+              pendingTeamOrchestrationFingerprint,
+            );
+          }
           // Serialize acceptance writes against dropped-terminal restoration so neither overwrites the other.
           yield* inlineDeliveryLock.withPermits(1)(
             Effect.gen(function* () {
