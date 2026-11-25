@@ -1,12 +1,12 @@
 import type {
   EnvironmentId,
+  ServerGetSkillsOverviewResult,
   SkillMatrixCell,
   SkillMatrixCellStatus,
   SkillMatrixDiagnostic,
   SkillMatrixEntry,
   SkillMatrixInstance,
   SkillMatrixScope,
-  ServerGetSkillsOverviewResult,
 } from "@t3tools/contracts";
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import {
@@ -33,37 +33,77 @@ import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { SettingsSection } from "./settingsLayout";
 
-export interface SkillsMatrixSectionProps {
+interface SkillsMatrixSectionProps {
   readonly environmentId: EnvironmentId;
-  readonly refreshToken?: number;
 }
 
-type SkillsFilter = "all" | "global" | "missing";
-
-const FILTER_VALUES: ReadonlyArray<SkillsFilter> = ["all", "global", "missing"];
-// A minus sign reads as a short dash without shipping an em dash in product copy.
+const SCOPE_TABS: ReadonlyArray<SkillMatrixScope> = ["universal", "agent_global", "builtin"];
+// Minus sign avoids shipping an em dash in UI copy.
 const MISSING_MARK = "\u2212";
 
-function isSkillsFilter(value: string | undefined): value is SkillsFilter {
-  return value !== undefined && (FILTER_VALUES as ReadonlyArray<string>).includes(value);
+interface DriverColumnGroup {
+  readonly key: string;
+  readonly label: string;
+  readonly instances: ReadonlyArray<SkillMatrixInstance>;
 }
 
-function hasMissingCell(
+function isSkillMatrixScope(value: string | undefined): value is SkillMatrixScope {
+  return value !== undefined && (SCOPE_TABS as ReadonlyArray<string>).includes(value);
+}
+
+function groupInstancesByDriver(
+  instances: ReadonlyArray<SkillMatrixInstance>,
+): ReadonlyArray<DriverColumnGroup> {
+  const groups: Array<{
+    readonly key: string;
+    readonly label: string;
+    readonly instances: Array<SkillMatrixInstance>;
+  }> = [];
+  const byKey = new Map<
+    string,
+    {
+      readonly key: string;
+      readonly label: string;
+      readonly instances: Array<SkillMatrixInstance>;
+    }
+  >();
+  for (const instance of instances) {
+    let group = byKey.get(instance.driverGroupKey);
+    if (!group) {
+      group = {
+        key: instance.driverGroupKey,
+        label: instance.driverGroupLabel,
+        instances: [],
+      };
+      byKey.set(instance.driverGroupKey, group);
+      groups.push(group);
+    }
+    group.instances.push(instance);
+  }
+  return groups;
+}
+
+function hasIssueInDisplayedInstances(
   entry: SkillMatrixEntry,
   instances: ReadonlyArray<SkillMatrixInstance>,
 ): boolean {
-  return instances.some((instance) => entry.cells[instance.instanceId]?.status === "missing");
+  return instances.some((instance) => {
+    const status = entry.cells[instance.instanceId]?.status;
+    return status === "missing" || status === "disk_warning";
+  });
 }
 
 function SkillStatusLabel({ status }: { readonly status: SkillMatrixCellStatus }) {
   const gt = useGT();
   switch (status) {
-    case "active":
-      return <>{gt("运行态已生效")}</>;
-    case "disk_only":
-      return <>{gt("仅磁盘存在")}</>;
+    case "declared_runtime":
+      return <>{gt("运行态已声明")}</>;
+    case "declared_disk":
+      return <>{gt("目录就绪")}</>;
+    case "disk_warning":
+      return <>{gt("磁盘异常")}</>;
     case "missing":
-      return <>{gt("缺失")}</>;
+      return <>{gt("未挂载 / 声明不到")}</>;
     case "not_applicable":
       return <>{gt("不适用")}</>;
   }
@@ -71,9 +111,11 @@ function SkillStatusLabel({ status }: { readonly status: SkillMatrixCellStatus }
 
 function statusToneClass(status: SkillMatrixCellStatus): string {
   switch (status) {
-    case "active":
+    case "declared_runtime":
       return "text-success-foreground";
-    case "disk_only":
+    case "declared_disk":
+      return "text-info-foreground";
+    case "disk_warning":
       return "text-warning-foreground";
     case "missing":
       return "text-muted-foreground";
@@ -83,38 +125,9 @@ function statusToneClass(status: SkillMatrixCellStatus): string {
 }
 
 function coverageToneClass(entry: SkillMatrixEntry): string {
-  if (entry.scope !== "global" || entry.totalEnabledCount === 0) return "text-muted-foreground";
-  return entry.coveredEnabledCount < entry.totalEnabledCount ? "text-warning" : "text-success";
-}
-
-function SkillScopeBadge({ scope }: { readonly scope: SkillMatrixScope }) {
-  const gt = useGT();
-  const label = scope === "global" ? gt("全局") : scope === "builtin" ? gt("内置") : gt("工作区");
-  return (
-    <Badge variant="outline" size="sm">
-      {label}
-    </Badge>
-  );
-}
-
-function SkillNameCell({
-  entry,
-  expanded,
-}: {
-  readonly entry: SkillMatrixEntry;
-  readonly expanded: boolean;
-}) {
-  return (
-    <span className="flex min-w-0 items-center gap-1.5">
-      {expanded ? (
-        <ChevronDownIcon className="size-3 shrink-0 text-muted-foreground" aria-hidden />
-      ) : (
-        <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground" aria-hidden />
-      )}
-      <span className="min-w-0 truncate font-mono font-medium text-foreground">{entry.name}</span>
-      <SkillScopeBadge scope={entry.scope} />
-    </span>
-  );
+  if (entry.expectedEnabledCount === 0) return "text-muted-foreground";
+  if (entry.coveredEnabledCount < entry.expectedEnabledCount) return "text-warning";
+  return "text-success";
 }
 
 function InstanceColumnHeader({ instance }: { readonly instance: SkillMatrixInstance }) {
@@ -127,7 +140,7 @@ function InstanceColumnHeader({ instance }: { readonly instance: SkillMatrixInst
         <span
           className={cn(
             "max-w-[68px] truncate text-2xs font-medium",
-            instance.enabled ? "text-foreground/80" : "text-muted-foreground",
+            instance.enabled ? "text-foreground/85" : "text-muted-foreground",
           )}
         >
           {instance.displayName}
@@ -138,18 +151,25 @@ function InstanceColumnHeader({ instance }: { readonly instance: SkillMatrixInst
       </TooltipTrigger>
       <TooltipPopup side="top">
         <div className="space-y-0.5">
-          <div className="font-medium">{instance.displayName}</div>
+          <div className="font-medium">
+            {instance.displayName} ({instance.driverGroupLabel})
+          </div>
           <div className="font-mono text-3xs text-muted-foreground">{instance.instanceId}</div>
-          <div className="font-mono text-3xs text-muted-foreground">{instance.driver}</div>
+          <div className="text-3xs text-muted-foreground">
+            {instance.readsUniversalPool
+              ? gt("原生扫描 ~/.agents/skills 真全局池")
+              : gt("不自动扫描 ~/.agents/skills（需显式挂载）")}
+          </div>
           {instance.globalSkillDirs.length > 0 ? (
-            instance.globalSkillDirs.map((dir) => (
-              <div key={dir} className="break-all font-mono text-3xs text-muted-foreground">
-                {dir}
-              </div>
-            ))
-          ) : (
-            <div className="text-3xs text-muted-foreground">{gt("未配置全局技能目录")}</div>
-          )}
+            <div className="pt-0.5">
+              <div className="text-3xs font-medium text-foreground/80">{gt("实际扫描目录：")}</div>
+              {instance.globalSkillDirs.map((dir) => (
+                <div key={dir} className="break-all font-mono text-3xs text-muted-foreground">
+                  {dir}
+                </div>
+              ))}
+            </div>
+          ) : null}
           {instance.enabled ? null : (
             <div className="text-3xs text-warning">{gt("该实例已停用")}</div>
           )}
@@ -163,7 +183,7 @@ function CellStatusMarker({ cell }: { readonly cell: SkillMatrixCell | undefined
   const gt = useGT();
   const status = cell?.status ?? "not_applicable";
 
-  if (status === "active") {
+  if (status === "declared_runtime") {
     return (
       <Tooltip>
         <TooltipTrigger
@@ -173,7 +193,7 @@ function CellStatusMarker({ cell }: { readonly cell: SkillMatrixCell | undefined
         </TooltipTrigger>
         <TooltipPopup side="top">
           <div className="space-y-0.5">
-            <div>{gt("运行态已生效")}</div>
+            <div className="font-medium">{gt("运行态已声明")}</div>
             {cell?.path ? (
               <div className="break-all font-mono text-3xs text-muted-foreground">{cell.path}</div>
             ) : null}
@@ -183,17 +203,45 @@ function CellStatusMarker({ cell }: { readonly cell: SkillMatrixCell | undefined
     );
   }
 
-  if (status === "disk_only") {
+  if (status === "declared_disk") {
     return (
       <Tooltip>
         <TooltipTrigger
           render={<span className="inline-flex size-4 items-center justify-center" />}
         >
-          <span className="size-2 rounded-full border-2 border-warning" />
+          <span className="inline-flex size-2.5 items-center justify-center rounded-full border border-info">
+            <span className="size-1 rounded-full bg-info" />
+          </span>
         </TooltipTrigger>
         <TooltipPopup side="top">
           <div className="space-y-0.5">
-            <div>{gt("仅磁盘目录存在，运行态未上报")}</div>
+            <div className="font-medium">{gt("目录就绪（按驱动规则可声明）")}</div>
+            {cell?.reason ? <div className="text-muted-foreground">{cell.reason}</div> : null}
+            {cell?.path ? (
+              <div className="break-all font-mono text-3xs text-muted-foreground">{cell.path}</div>
+            ) : null}
+            {cell?.linkTarget ? (
+              <div className="break-all font-mono text-3xs text-muted-foreground">
+                → {cell.linkTarget}
+              </div>
+            ) : null}
+          </div>
+        </TooltipPopup>
+      </Tooltip>
+    );
+  }
+
+  if (status === "disk_warning") {
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={<span className="inline-flex size-4 items-center justify-center" />}
+        >
+          <TriangleAlertIcon className="size-3 text-warning" />
+        </TooltipTrigger>
+        <TooltipPopup side="top">
+          <div className="space-y-0.5">
+            <div className="font-medium text-warning">{gt("磁盘存在但可能未被声明")}</div>
             {cell?.reason ? <div className="text-muted-foreground">{cell.reason}</div> : null}
             {cell?.path ? (
               <div className="break-all font-mono text-3xs text-muted-foreground">{cell.path}</div>
@@ -215,11 +263,11 @@ function CellStatusMarker({ cell }: { readonly cell: SkillMatrixCell | undefined
         <TooltipTrigger
           render={<span className="inline-flex size-4 items-center justify-center" />}
         >
-          <span className="text-xs leading-none text-muted-foreground/50">{MISSING_MARK}</span>
+          <span className="text-xs leading-none text-muted-foreground/55">{MISSING_MARK}</span>
         </TooltipTrigger>
         <TooltipPopup side="top">
           <div className="space-y-0.5">
-            <div>{gt("该实例缺失此全局技能")}</div>
+            <div className="font-medium">{gt("未挂载 / 声明不到")}</div>
             {cell?.reason ? <div className="text-muted-foreground">{cell.reason}</div> : null}
           </div>
         </TooltipPopup>
@@ -232,7 +280,12 @@ function CellStatusMarker({ cell }: { readonly cell: SkillMatrixCell | undefined
       <TooltipTrigger render={<span className="inline-flex size-4 items-center justify-center" />}>
         <span className="text-3xs leading-none text-muted-foreground/30">·</span>
       </TooltipTrigger>
-      <TooltipPopup side="top">{gt("其他驱动私有技能，不适用")}</TooltipPopup>
+      <TooltipPopup side="top">
+        <div className="space-y-0.5">
+          <div>{gt("不适用")}</div>
+          {cell?.reason ? <div className="text-muted-foreground">{cell.reason}</div> : null}
+        </div>
+      </TooltipPopup>
     </Tooltip>
   );
 }
@@ -244,46 +297,44 @@ function SkillDetailRow({
   readonly entry: SkillMatrixEntry;
   readonly instances: ReadonlyArray<SkillMatrixInstance>;
 }) {
+  const gt = useGT();
   const rows = instances.flatMap((instance) => {
     const cell = entry.cells[instance.instanceId];
     return cell === undefined || cell.status === "not_applicable" ? [] : [{ instance, cell }];
   });
 
   return (
-    <div className="space-y-1.5 bg-muted/10 px-3 py-2">
+    <div className="space-y-2 border-t bg-muted/20 px-3 py-2.5 text-xs">
       {entry.description ? (
-        <p className="text-xs text-muted-foreground">{entry.description}</p>
+        <p className="text-pretty leading-relaxed text-muted-foreground">{entry.description}</p>
       ) : null}
       {entry.canonicalPath ? (
-        <p className="break-all font-mono text-3xs text-muted-foreground">{entry.canonicalPath}</p>
+        <div className="flex flex-wrap items-baseline gap-1.5 text-2xs">
+          <span className="shrink-0 font-medium text-foreground/75">{gt("源路径：")}</span>
+          <span className="break-all font-mono text-muted-foreground">{entry.canonicalPath}</span>
+        </div>
       ) : null}
       {rows.length > 0 ? (
-        <div className="grid gap-1 sm:grid-cols-2">
+        <div className="divide-y divide-border/50 rounded-md border bg-background/70">
           {rows.map(({ instance, cell }) => (
             <div
               key={instance.instanceId}
-              className="min-w-0 space-y-0.5 rounded-md border border-border/50 px-2 py-1"
+              className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 px-2.5 py-1.5 text-2xs"
             >
-              <div className="flex min-w-0 items-center gap-1.5 text-2xs">
-                <span className="min-w-0 truncate font-medium text-foreground/80">
-                  {instance.displayName}
-                </span>
-                <span className={cn("shrink-0", statusToneClass(cell.status))}>
-                  <SkillStatusLabel status={cell.status} />
-                </span>
-              </div>
+              <span className="min-w-28 shrink-0 font-medium text-foreground">
+                {instance.driverGroupLabel} · {instance.displayName}
+              </span>
+              <span className={cn("shrink-0 font-medium", statusToneClass(cell.status))}>
+                <SkillStatusLabel status={cell.status} />
+              </span>
               {cell.path ? (
-                <div className="break-all font-mono text-3xs text-muted-foreground">
+                <span className="min-w-0 break-all font-mono text-muted-foreground">
                   {cell.path}
-                </div>
-              ) : null}
-              {cell.linkTarget ? (
-                <div className="break-all font-mono text-3xs text-muted-foreground">
-                  → {cell.linkTarget}
-                </div>
+                  {cell.linkTarget ? ` → ${cell.linkTarget}` : ""}
+                </span>
               ) : null}
               {cell.reason ? (
-                <div className="text-3xs text-muted-foreground">{cell.reason}</div>
+                <span className="min-w-0 text-muted-foreground">{cell.reason}</span>
               ) : null}
             </div>
           ))}
@@ -294,36 +345,36 @@ function SkillDetailRow({
 }
 
 function DiagnosticBanner({ diagnostic }: { readonly diagnostic: SkillMatrixDiagnostic }) {
-  const gt = useGT();
-  const warning = diagnostic.severity === "warning";
-  const Icon = warning ? TriangleAlertIcon : InfoIcon;
-
+  const isWarning = diagnostic.severity === "warning";
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <div
             className={cn(
-              "flex min-w-0 items-center gap-2 rounded-md border px-2 py-1 text-xs",
-              warning
+              "flex min-w-0 items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+              isWarning
                 ? "border-warning/40 bg-warning/5 text-warning-foreground"
-                : "border-border/60 bg-muted/20 text-muted-foreground",
+                : "border-border bg-muted/40 text-muted-foreground",
             )}
           />
         }
       >
-        <Icon className="size-3 shrink-0" aria-hidden />
+        {isWarning ? (
+          <TriangleAlertIcon className="size-3.5 shrink-0 text-warning" aria-hidden />
+        ) : (
+          <InfoIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        )}
         <span className="min-w-0 flex-1 truncate">{diagnostic.message}</span>
         {diagnostic.detail ? (
-          <span className="hidden max-w-[45%] min-w-0 truncate text-3xs opacity-70 sm:inline">
+          <span className="hidden max-w-64 shrink-0 truncate font-mono text-2xs opacity-80 sm:inline">
             {diagnostic.detail}
           </span>
         ) : null}
-        <span className="sr-only">{gt("查看诊断详情")}</span>
       </TooltipTrigger>
       <TooltipPopup side="top">
-        <div className="space-y-0.5">
-          <div>{diagnostic.message}</div>
+        <div className="max-w-96 space-y-1">
+          <div className="font-medium">{diagnostic.message}</div>
           {diagnostic.detail ? (
             <div className="break-all font-mono text-3xs text-muted-foreground">
               {diagnostic.detail}
@@ -339,120 +390,169 @@ function SkillsMatrixTable({
   skills,
   instances,
   checkedAt,
+  showOwnerBadges,
   expandedSkills,
   onToggleSkill,
 }: {
   readonly skills: ReadonlyArray<SkillMatrixEntry>;
   readonly instances: ReadonlyArray<SkillMatrixInstance>;
   readonly checkedAt: string;
+  readonly showOwnerBadges: boolean;
   readonly expandedSkills: Readonly<Record<string, boolean>>;
   readonly onToggleSkill: (name: string) => void;
 }) {
   const gt = useGT();
-  const timestampFormat = useClientSettings((settings) => settings.timestampFormat);
-  const columnCount = instances.length + 2;
+  const timestampFormat = useClientSettings().timestampFormat;
+  const checkedLabel = formatDateTimeTimestamp(checkedAt, timestampFormat);
+  const groups = groupInstancesByDriver(instances);
+  const totalColumns = instances.length + 2;
 
   return (
-    <div className="overflow-x-auto rounded-lg border border-border/60">
-      <table className="w-full min-w-max border-collapse text-xs">
-        <thead>
-          <tr className="bg-muted/20 text-2xs text-muted-foreground">
-            <th scope="col" className="min-w-[168px] px-2 py-1.5 text-left font-medium">
-              {gt("技能")}
-            </th>
-            <th scope="col" className="w-16 px-1 py-1.5 text-center font-medium">
-              {gt("覆盖")}
-            </th>
-            {instances.map((instance) => (
-              <th
-                key={instance.instanceId}
-                scope="col"
-                className="min-w-[54px] px-1 py-1.5 text-center align-bottom font-medium"
-              >
-                <InstanceColumnHeader instance={instance} />
+    <div className="overflow-hidden rounded-lg border">
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-xs">
+          <thead>
+            <tr className="border-b bg-muted/40 text-2xs font-medium text-muted-foreground">
+              <th rowSpan={2} className="min-w-[180px] px-3 py-1.5 text-left align-bottom">
+                {gt("技能")}
               </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {skills.map((entry) => {
-            const expanded = expandedSkills[entry.name] ?? false;
-            return (
-              <Fragment key={entry.name}>
-                <tr
-                  tabIndex={0}
-                  aria-expanded={expanded}
-                  className={cn(
-                    "cursor-pointer border-t border-border/40 outline-none hover:bg-muted/20 focus-visible:bg-muted/30",
-                    expanded && "bg-muted/10",
-                  )}
-                  onClick={() => onToggleSkill(entry.name)}
-                  onKeyDown={(event) => {
-                    if (event.key !== "Enter" && event.key !== " ") return;
-                    event.preventDefault();
-                    onToggleSkill(entry.name);
-                  }}
+              <th rowSpan={2} className="w-16 px-2 py-1.5 text-center align-bottom">
+                {gt("覆盖")}
+              </th>
+              {groups.map((group) => (
+                <th
+                  key={group.key}
+                  colSpan={group.instances.length}
+                  className="border-l border-border/60 px-2 py-1 text-center text-3xs font-semibold text-foreground/75"
                 >
-                  <td className="min-w-[168px] px-2 py-2">
-                    <SkillNameCell entry={entry} expanded={expanded} />
-                  </td>
-                  <td
+                  {group.label}
+                </th>
+              ))}
+            </tr>
+            <tr className="border-b bg-muted/25 text-2xs font-medium text-muted-foreground">
+              {groups.flatMap((group) =>
+                group.instances.map((instance, idx) => (
+                  <th
+                    key={instance.instanceId}
                     className={cn(
-                      "w-16 px-1 py-2 text-center font-mono tabular-nums",
-                      coverageToneClass(entry),
+                      "min-w-[56px] px-1.5 py-1 text-center font-normal",
+                      idx === 0 && "border-l border-border/60",
                     )}
                   >
-                    {entry.coveredEnabledCount}/{entry.totalEnabledCount}
-                  </td>
-                  {instances.map((instance) => (
-                    <td key={instance.instanceId} className="min-w-[54px] px-1 py-2 text-center">
-                      <CellStatusMarker cell={entry.cells[instance.instanceId]} />
+                    <InstanceColumnHeader instance={instance} />
+                  </th>
+                )),
+              )}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border/60">
+            {skills.map((entry) => {
+              const expanded = expandedSkills[entry.name] === true;
+              return (
+                <Fragment key={entry.name}>
+                  <tr
+                    tabIndex={0}
+                    aria-expanded={expanded}
+                    onClick={() => onToggleSkill(entry.name)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onToggleSkill(entry.name);
+                      }
+                    }}
+                    className={cn(
+                      "cursor-pointer transition-colors hover:bg-muted/35 focus-visible:bg-muted/35 focus-visible:outline-none",
+                      expanded && "bg-muted/25",
+                    )}
+                  >
+                    <td className="px-3 py-2 align-middle">
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        {expanded ? (
+                          <ChevronDownIcon
+                            className="size-3 shrink-0 text-muted-foreground"
+                            aria-hidden
+                          />
+                        ) : (
+                          <ChevronRightIcon
+                            className="size-3 shrink-0 text-muted-foreground"
+                            aria-hidden
+                          />
+                        )}
+                        <span className="min-w-0 truncate font-mono font-medium text-foreground">
+                          {entry.name}
+                        </span>
+                        {showOwnerBadges
+                          ? entry.ownerGroupLabels.map((label) => (
+                              <Badge key={label} variant="outline" size="sm">
+                                {label}
+                              </Badge>
+                            ))
+                          : null}
+                      </span>
                     </td>
-                  ))}
-                </tr>
-                {expanded ? (
-                  <tr className="border-t border-border/30">
-                    <td colSpan={columnCount} className="p-0">
-                      <SkillDetailRow entry={entry} instances={instances} />
+                    <td
+                      className={cn(
+                        "px-2 py-2 text-center align-middle font-mono text-2xs tabular-nums",
+                        coverageToneClass(entry),
+                      )}
+                    >
+                      {entry.coveredEnabledCount}/{entry.expectedEnabledCount}
                     </td>
+                    {groups.flatMap((group) =>
+                      group.instances.map((instance, idx) => (
+                        <td
+                          key={instance.instanceId}
+                          className={cn(
+                            "px-1.5 py-2 text-center align-middle",
+                            idx === 0 && "border-l border-border/40",
+                          )}
+                        >
+                          <CellStatusMarker cell={entry.cells[instance.instanceId]} />
+                        </td>
+                      )),
+                    )}
                   </tr>
-                ) : null}
-              </Fragment>
-            );
-          })}
-        </tbody>
-      </table>
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border/50 px-2 py-1 text-3xs text-muted-foreground">
-        <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  {expanded ? (
+                    <tr>
+                      <td colSpan={totalColumns} className="p-0">
+                        <SkillDetailRow entry={entry} instances={instances} />
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t bg-muted/20 px-3 py-1.5 text-3xs text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
           <span className="inline-flex items-center gap-1">
-            <span className="size-2 rounded-full bg-success" aria-hidden />
-            {gt("运行态生效")}
+            <span className="size-1.5 rounded-full bg-success" />
+            {gt("运行态已声明")}
           </span>
-          <span aria-hidden>·</span>
           <span className="inline-flex items-center gap-1">
-            <span className="size-2 rounded-full border-2 border-warning" aria-hidden />
-            {gt("仅磁盘存在")}
+            <span className="inline-flex size-2 items-center justify-center rounded-full border border-info">
+              <span className="size-0.5 rounded-full bg-info" />
+            </span>
+            {gt("目录就绪")}
           </span>
-          <span aria-hidden>·</span>
           <span className="inline-flex items-center gap-1">
-            <span className="text-muted-foreground/50">{MISSING_MARK}</span>
-            {gt("缺失")}
+            <TriangleAlertIcon className="size-2.5 text-warning" aria-hidden />
+            {gt("磁盘异常")}
           </span>
-          <span aria-hidden>·</span>
-          <span className="inline-flex items-center gap-1">
-            <span className="text-muted-foreground/30">·</span>
-            {gt("不适用")}
+          <span>
+            {MISSING_MARK} {gt("缺失")}
           </span>
-        </span>
-        <span className="tabular-nums">
-          {gt("最近检查：{time}", { time: formatDateTimeTimestamp(checkedAt, timestampFormat) })}
-        </span>
+          <span>· {gt("不适用")}</span>
+        </div>
+        <span className="tabular-nums">{gt("最近检查：{time}", { time: checkedLabel })}</span>
       </div>
     </div>
   );
 }
 
-export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatrixSectionProps) {
+export function SkillsMatrixSection({ environmentId }: SkillsMatrixSectionProps) {
   const gt = useGT();
   const getSkillsOverview = useAtomCommand(serverEnvironment.getSkillsOverview, {
     reportFailure: false,
@@ -461,8 +561,9 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
   const [overview, setOverview] = useState<ServerGetSkillsOverviewResult | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [activeScopeTab, setActiveScopeTab] = useState<SkillMatrixScope>("universal");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<SkillsFilter>("global");
+  const [issuesOnly, setIssuesOnly] = useState(false);
   const [includeDisabled, setIncludeDisabled] = useState(false);
   const [expandedSkills, setExpandedSkills] = useState<Readonly<Record<string, boolean>>>({});
   const loadGeneration = useRef(0);
@@ -470,7 +571,7 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
   const errorText = useStableCallback((error: unknown) =>
     error instanceof Error
       ? (thrownErrorMessage(error, resolveNow) ?? error.message)
-      : gt("无法读取技能覆盖。"),
+      : gt("无法读取技能声明状态。"),
   );
 
   const loadOverview = useStableCallback(() => {
@@ -489,31 +590,47 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
     });
   });
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the coverage matrix from the server on mount and when the refresh token changes; the atom registry holds no such resource
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the global skills overview from the server on mount and environment switch; no reactive atom backs this scan
   useEffect(() => {
     loadOverview();
     return () => {
-      // Stale responses from a previous environment are discarded by the generation check.
       loadGeneration.current += 1;
     };
-    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- reload on environment or refresh token changes; the stable loader reads the environment through its closure
-  }, [environmentId, refreshToken, loadOverview]);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- reload only when environmentId changes; loadOverview is a stable callback
+  }, [environmentId, loadOverview]);
 
   const allSkills = overview?.skills ?? [];
   const instances = (overview?.instances ?? []).filter(
     (instance) => includeDisabled || instance.enabled,
   );
-  const globalCount = allSkills.filter((skill) => skill.scope === "global").length;
-  const missingCount = allSkills.filter((skill) => hasMissingCell(skill, instances)).length;
-  const activeFilter: SkillsFilter = filter === "global" && globalCount === 0 ? "all" : filter;
+  const universalSkills = allSkills.filter((skill) => skill.scope === "universal");
+  const agentGlobalSkills = allSkills.filter((skill) => skill.scope === "agent_global");
+  const builtinSkills = allSkills.filter((skill) => skill.scope === "builtin");
+
+  const effectiveTab: SkillMatrixScope =
+    activeScopeTab === "universal" && universalSkills.length === 0 && agentGlobalSkills.length > 0
+      ? "agent_global"
+      : activeScopeTab;
+
+  const scopedSkills =
+    effectiveTab === "universal"
+      ? universalSkills
+      : effectiveTab === "agent_global"
+        ? agentGlobalSkills
+        : builtinSkills;
+
+  const issueCountInTab = scopedSkills.filter((skill) =>
+    hasIssueInDisplayedInstances(skill, instances),
+  ).length;
+
   const normalizedSearch = search.trim().toLowerCase();
-  const visibleSkills = allSkills.filter((skill) => {
-    if (activeFilter === "global" && skill.scope !== "global") return false;
-    if (activeFilter === "missing" && !hasMissingCell(skill, instances)) return false;
+  const visibleSkills = scopedSkills.filter((skill) => {
+    if (issuesOnly && !hasIssueInDisplayedInstances(skill, instances)) return false;
     if (normalizedSearch.length === 0) return true;
     return (
       skill.name.toLowerCase().includes(normalizedSearch) ||
-      (skill.description?.toLowerCase().includes(normalizedSearch) ?? false)
+      (skill.description?.toLowerCase().includes(normalizedSearch) ?? false) ||
+      skill.ownerGroupLabels.some((label) => label.toLowerCase().includes(normalizedSearch))
     );
   });
 
@@ -523,22 +640,31 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
     setExpandedSkills((current) => ({ ...current, [name]: !(current[name] ?? false) }));
   };
 
+  const tabHint =
+    effectiveTab === "universal"
+      ? gt("来源：{dir}（跨 Agent 通用池，预期所有已启用实例都应声明到）", {
+          dir: overview?.universalPoolDir ?? "~/.agents/skills",
+        })
+      : effectiveTab === "agent_global"
+        ? gt("仅位于某类 Agent 专属全局目录的技能，只校验同驱动各实例覆盖，其他驱动标记为不适用。")
+        : gt("各驱动自带的内置技能，仅在该驱动下声明。");
+
   const renderBody = () => {
     if (overview === null) {
       if (isLoading) {
         return (
           <div
-            className="flex items-center gap-2 py-2 text-xs text-muted-foreground"
+            className="flex items-center gap-2 py-4 text-xs text-muted-foreground"
             aria-busy="true"
           >
             <Spinner size="xs" />
-            {gt("正在读取技能覆盖…")}
+            {gt("正在扫描各 Agent 全局技能目录…")}
           </div>
         );
       }
       return (
-        <div className="flex flex-wrap items-center gap-2 py-2 text-xs text-muted-foreground">
-          <span className="min-w-0 flex-1">{errorMessage ?? gt("无法读取技能覆盖。")}</span>
+        <div className="flex flex-wrap items-center gap-2 py-4 text-xs text-muted-foreground">
+          <span className="min-w-0 flex-1">{errorMessage ?? gt("无法读取技能声明状态。")}</span>
           <Button size="xs" variant="outline" disabled={isLoading} onClick={() => loadOverview()}>
             {gt("重试")}
           </Button>
@@ -548,16 +674,18 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
 
     if (instances.length === 0) {
       return (
-        <p className="py-2 text-xs text-muted-foreground">
-          {gt("没有已启用的供应商实例，勾选「含已停用实例」查看全部。")}
+        <p className="py-4 text-xs text-muted-foreground">
+          {gt("没有已启用的智能体实例，打开「含已停用实例」查看全部。")}
         </p>
       );
     }
 
     if (visibleSkills.length === 0) {
       return (
-        <p className="py-2 text-xs text-muted-foreground">
-          {allSkills.length === 0 ? gt("尚未发现任何技能。") : gt("没有符合筛选条件的技能。")}
+        <p className="py-4 text-xs text-muted-foreground">
+          {scopedSkills.length === 0
+            ? gt("当前分层下暂无技能。")
+            : gt("当前筛选条件下没有匹配的技能。")}
         </p>
       );
     }
@@ -567,6 +695,7 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
         skills={visibleSkills}
         instances={instances}
         checkedAt={overview.checkedAt}
+        showOwnerBadges={effectiveTab === "agent_global"}
         expandedSkills={expandedSkills}
         onToggleSkill={toggleSkill}
       />
@@ -575,8 +704,8 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
 
   return (
     <SettingsSection
-      id="provider-skills"
-      title={gt("全局技能矩阵")}
+      id="skills-overview"
+      title={gt("全局技能覆盖")}
       headerAction={
         <Button
           size="xs"
@@ -590,33 +719,53 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
         </Button>
       }
     >
-      <div className="space-y-2 px-3 py-2 sm:px-4">
+      <div className="space-y-2.5 px-3 py-2.5 sm:px-4">
         <p className="text-pretty text-xs leading-normal text-muted-foreground">
-          {gt("汇总各供应商实例的运行态加载与磁盘全局技能覆盖，一眼识别缺失或仅磁盘未生效项。")}
+          {gt(
+            "按「真全局池 / Agent 专属全局 / 驱动内置」分层展示每个技能在各 Agent 实例中的真实声明状态（不统计单项目技能）。",
+          )}
         </p>
+
         <div className="flex flex-wrap items-center gap-2">
+          <ToggleGroup
+            aria-label={gt("技能分层")}
+            variant="segmented"
+            value={[effectiveTab]}
+            onValueChange={(next) => {
+              const selected = next[0];
+              if (isSkillMatrixScope(selected)) setActiveScopeTab(selected);
+            }}
+          >
+            <Toggle value="universal">
+              {gt("真全局 ({count})", { count: universalSkills.length })}
+            </Toggle>
+            <Toggle value="agent_global">
+              {gt("Agent 专属 ({count})", { count: agentGlobalSkills.length })}
+            </Toggle>
+            <Toggle value="builtin">
+              {gt("驱动内置 ({count})", { count: builtinSkills.length })}
+            </Toggle>
+          </ToggleGroup>
+
           <Input
             size="compact"
             className="w-44"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            placeholder={gt("按技能名或描述搜索")}
+            placeholder={gt("搜索技能或驱动")}
             aria-label={gt("搜索技能")}
             spellCheck={false}
           />
-          <ToggleGroup
-            aria-label={gt("技能筛选")}
-            variant="segmented"
-            value={[activeFilter]}
-            onValueChange={(next) => {
-              const selected = next[0];
-              if (isSkillsFilter(selected)) setFilter(selected);
-            }}
+
+          <Toggle
+            variant="outline"
+            size="xs"
+            pressed={issuesOnly}
+            onPressedChange={(pressed) => setIssuesOnly(Boolean(pressed))}
           >
-            <Toggle value="all">{gt("全部 ({count})", { count: allSkills.length })}</Toggle>
-            <Toggle value="global">{gt("仅全局 ({count})", { count: globalCount })}</Toggle>
-            <Toggle value="missing">{gt("有缺失 ({count})", { count: missingCount })}</Toggle>
-          </ToggleGroup>
+            {gt("仅看缺失/异常 ({count})", { count: issueCountInTab })}
+          </Toggle>
+
           <Toggle
             variant="outline"
             size="xs"
@@ -626,13 +775,15 @@ export function SkillsMatrixSection({ environmentId, refreshToken }: SkillsMatri
             {gt("含已停用实例")}
           </Toggle>
         </div>
+
+        <p className="font-mono text-3xs text-muted-foreground">{tabHint}</p>
       </div>
 
       {diagnostics.length > 0 ? (
-        <div className="space-y-1 px-3 pb-2 sm:px-4">
+        <div className="space-y-1 px-3 pb-2.5 sm:px-4">
           {diagnostics.map((diagnostic) => (
             <DiagnosticBanner
-              key={`${diagnostic.code}:${diagnostic.message}`}
+              key={`${diagnostic.code}:${diagnostic.message}:${diagnostic.detail ?? ""}`}
               diagnostic={diagnostic}
             />
           ))}

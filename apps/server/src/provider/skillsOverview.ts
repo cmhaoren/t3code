@@ -9,6 +9,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   IsoDateTime,
   NonNegativeInt,
+  PROVIDER_DISPLAY_NAMES,
   type ProviderInstanceId,
   SkillsOverviewError,
   type ServerGetSkillsOverviewResult,
@@ -42,18 +43,41 @@ const decodeAntigravitySkillsJson = Schema.decodeUnknownOption(
 interface DiscoveredDiskSkill {
   readonly name: string;
   readonly description?: string;
+  readonly hasValidFrontmatter: boolean;
   readonly skillMdPath: string;
   readonly dirPath: string;
+  readonly sourceDir: string;
   readonly linkTarget?: string;
   readonly fromSkillsJson?: boolean;
+  readonly manifestPathNonAbsolute?: boolean;
 }
 
-interface InstanceSkillDirsInfo {
+interface ManifestEntryScan {
+  readonly rawPath: string;
+  readonly resolvedDir: string;
+  readonly nonAbsoluteOnWindows: boolean;
+}
+
+interface InstanceSkillSpec {
+  readonly driverGroupKey: string;
+  readonly driverGroupLabel: string;
   readonly dirs: ReadonlyArray<string>;
-  readonly manifestEntryDirs: ReadonlyArray<string>;
+  readonly writableGlobalSkillDir: string;
+  readonly readsUniversalPool: boolean;
+  readonly manifestEntries: ReadonlyArray<ManifestEntryScan>;
   readonly factoryHomeOverride?: string;
   readonly isFactoryDroid: boolean;
-  readonly antigravityConfigSkillsDirs: ReadonlyArray<string>;
+}
+
+function isIgnoredSkillDirName(entryName: string): boolean {
+  const lower = entryName.toLowerCase();
+  return (
+    entryName.startsWith(".") ||
+    entryName.startsWith("_") ||
+    lower.includes(".backup") ||
+    lower.includes(".disabled") ||
+    lower.endsWith(".bak")
+  );
 }
 
 function expandHome(rawPath: string, userHome: string): string {
@@ -68,9 +92,10 @@ function expandHome(rawPath: string, userHome: string): string {
 function parseSkillFrontmatter(content: string): {
   readonly name?: string;
   readonly description?: string;
+  readonly hasValidFrontmatter: boolean;
 } {
   const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content);
-  if (!match) return {};
+  if (!match) return { hasValidFrontmatter: false };
   const body = match[1] ?? "";
   let name: string | undefined;
   let description: string | undefined;
@@ -108,6 +133,7 @@ function parseSkillFrontmatter(content: string): {
   return {
     ...(name !== undefined ? { name } : {}),
     ...(description !== undefined ? { description } : {}),
+    hasValidFrontmatter: name !== undefined && description !== undefined,
   };
 }
 
@@ -122,7 +148,7 @@ async function pathExists(targetPath: string): Promise<boolean> {
 
 async function scanSkillsDirectory(
   rootDir: string,
-  options?: { readonly fromSkillsJson?: boolean },
+  options?: { readonly fromSkillsJson?: boolean; readonly manifestPathNonAbsolute?: boolean },
 ): Promise<ReadonlyArray<DiscoveredDiskSkill>> {
   let entries: ReadonlyArray<string>;
   try {
@@ -132,7 +158,7 @@ async function scanSkillsDirectory(
   }
   const results: Array<DiscoveredDiskSkill> = [];
   for (const entryName of entries) {
-    if (entryName.startsWith(".")) continue;
+    if (isIgnoredSkillDirName(entryName)) continue;
     const entryPath = NodePath.join(rootDir, entryName);
     let linkTarget: string | undefined;
     try {
@@ -161,10 +187,13 @@ async function scanSkillsDirectory(
     results.push({
       name,
       ...(meta.description !== undefined ? { description: meta.description } : {}),
+      hasValidFrontmatter: meta.hasValidFrontmatter,
       skillMdPath,
       dirPath: entryPath,
+      sourceDir: rootDir,
       ...(linkTarget !== undefined ? { linkTarget } : {}),
       ...(options?.fromSkillsJson ? { fromSkillsJson: true } : {}),
+      ...(options?.manifestPathNonAbsolute ? { manifestPathNonAbsolute: true } : {}),
     });
   }
   return results;
@@ -173,7 +202,8 @@ async function scanSkillsDirectory(
 async function readAntigravitySkillsJsonEntries(
   skillsJsonPath: string,
   userHome: string,
-): Promise<ReadonlyArray<string>> {
+  platform: NodeJS.Platform,
+): Promise<ReadonlyArray<ManifestEntryScan>> {
   let raw: string;
   try {
     raw = await NodeFSP.readFile(skillsJsonPath, "utf8");
@@ -184,11 +214,19 @@ async function readAntigravitySkillsJsonEntries(
   if (Option.isNone(decoded)) {
     return [];
   }
-  const resolved: Array<string> = [];
+  const resolved: Array<ManifestEntryScan> = [];
   for (const entry of decoded.value.entries ?? []) {
     const trimmed = entry.path.trim();
     if (trimmed.length === 0) continue;
-    resolved.push(NodePath.resolve(expandHome(trimmed, userHome)));
+    // Antigravity's Windows Go binary calls filepath.IsAbs without expanding "~/" first.
+    const nonAbsoluteOnWindows =
+      platform === "win32" &&
+      (trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\"));
+    resolved.push({
+      rawPath: trimmed,
+      resolvedDir: NodePath.resolve(expandHome(trimmed, userHome)),
+      nonAbsoluteOnWindows,
+    });
   }
   return resolved;
 }
@@ -234,18 +272,23 @@ function readAcpInstanceMeta(
   };
 }
 
-async function resolveInstanceSkillDirs(input: {
+/**
+ * Resolve each provider instance's real global skill discovery specification.
+ * Grounded in actual CLI behavior on this machine (ignores single-project workspace skills).
+ */
+async function resolveInstanceSkillSpec(input: {
   readonly provider: ServerProvider;
   readonly settings: ServerSettings;
   readonly stateDir: string;
   readonly userHome: string;
-}): Promise<InstanceSkillDirsInfo> {
-  const { provider, settings, stateDir, userHome } = input;
+  readonly platform: NodeJS.Platform;
+}): Promise<InstanceSkillSpec> {
+  const { provider, settings, stateDir, userHome, platform } = input;
   const dirs: Array<string> = [];
-  const manifestEntryDirs: Array<string> = [];
-  const antigravityConfigSkillsDirs: Array<string> = [];
+  const manifestEntries: Array<ManifestEntryScan> = [];
   let factoryHomeOverride: string | undefined;
   let isFactoryDroid = false;
+  let readsUniversalPool = false;
 
   const pushUnique = (list: Array<string>, dir: string) => {
     const normalized = NodePath.resolve(dir);
@@ -254,27 +297,44 @@ async function resolveInstanceSkillDirs(input: {
     }
   };
 
+  const universalPoolDir = NodePath.join(userHome, ".agents", "skills");
+  let driverGroupKey: string = provider.driver;
+  let driverGroupLabel: string =
+    PROVIDER_DISPLAY_NAMES[provider.driver as keyof typeof PROVIDER_DISPLAY_NAMES] ??
+    provider.driver;
+  let writableGlobalSkillDir = universalPoolDir;
+
   if (provider.driver === "antigravity") {
+    driverGroupKey = "antigravity";
+    driverGroupLabel = "Antigravity";
+    readsUniversalPool = false;
     const key = NodeCrypto.createHash("sha256").update(provider.instanceId).digest("hex");
     const profileDir = NodePath.join(stateDir, "providers", "antigravity", key);
     const profileSkillsDir = NodePath.join(profileDir, "config", "skills");
     const globalSkillsDir = NodePath.join(userHome, ".gemini", "config", "skills");
+    writableGlobalSkillDir = globalSkillsDir;
     pushUnique(dirs, profileSkillsDir);
     pushUnique(dirs, globalSkillsDir);
-    pushUnique(antigravityConfigSkillsDirs, profileSkillsDir);
-    pushUnique(antigravityConfigSkillsDirs, globalSkillsDir);
 
     const profileManifest = await readAntigravitySkillsJsonEntries(
       NodePath.join(profileDir, "config", "skills.json"),
       userHome,
+      platform,
     );
     const globalManifest = await readAntigravitySkillsJsonEntries(
       NodePath.join(userHome, ".gemini", "config", "skills.json"),
       userHome,
+      platform,
     );
-    for (const entryDir of [...profileManifest, ...globalManifest]) {
-      pushUnique(manifestEntryDirs, entryDir);
-      pushUnique(dirs, entryDir);
+    for (const entry of [...profileManifest, ...globalManifest]) {
+      if (
+        !manifestEntries.some(
+          (existing) => existing.resolvedDir.toLowerCase() === entry.resolvedDir.toLowerCase(),
+        )
+      ) {
+        manifestEntries.push(entry);
+      }
+      pushUnique(dirs, entry.resolvedDir);
     }
   } else if (provider.driver === "acpRegistry") {
     const meta = readAcpInstanceMeta(settings, provider.instanceId);
@@ -285,77 +345,103 @@ async function resolveInstanceSkillDirs(input: {
     );
     if (meta.agentId === "factory-droid" || factoryHomeOverride !== undefined) {
       isFactoryDroid = true;
+      driverGroupKey = "acpRegistry:factory-droid";
+      driverGroupLabel = "Factory Droid";
       const factoryHome = factoryHomeOverride ?? userHome;
-      pushUnique(dirs, NodePath.join(factoryHome, ".factory", "skills"));
+      const factorySkillsDir = NodePath.join(factoryHome, ".factory", "skills");
+      const factoryAgentsDir = NodePath.join(factoryHome, ".agents", "skills");
+      writableGlobalSkillDir = factorySkillsDir;
+      // Factory Droid reads <FACTORY_HOME>/.factory/skills and <FACTORY_HOME>/.agents/skills.
+      // When FACTORY_HOME_OVERRIDE is set, it reads the override home's .agents/skills, NOT the user's ~/.agents/skills!
+      readsUniversalPool = factoryHomeOverride === undefined;
+      pushUnique(dirs, factorySkillsDir);
+      pushUnique(dirs, factoryAgentsDir);
     } else if (
       provider.instanceId.toLowerCase() === "dsh" ||
       meta.commandPath?.toLowerCase().includes("dsh") === true
     ) {
+      driverGroupKey = "acpRegistry:dsh";
+      driverGroupLabel = "DeepSeek Harness";
+      readsUniversalPool = true;
+      writableGlobalSkillDir = NodePath.join(userHome, ".dsh", "skills");
       pushUnique(dirs, NodePath.join(userHome, ".dsh", "skills"));
-      pushUnique(dirs, NodePath.join(userHome, ".agents", "skills"));
+      pushUnique(dirs, universalPoolDir);
     } else {
-      pushUnique(dirs, NodePath.join(userHome, ".agents", "skills"));
+      driverGroupKey = meta.agentId ? `acpRegistry:${meta.agentId}` : "acpRegistry";
+      driverGroupLabel = meta.agentId ?? "ACP";
+      readsUniversalPool = true;
+      writableGlobalSkillDir = universalPoolDir;
+      pushUnique(dirs, universalPoolDir);
     }
   } else if (provider.driver === "codex") {
+    driverGroupKey = "codex";
+    driverGroupLabel = "Codex";
+    readsUniversalPool = true;
+    writableGlobalSkillDir = NodePath.join(userHome, ".codex", "skills");
     pushUnique(dirs, NodePath.join(userHome, ".codex", "skills"));
+    pushUnique(dirs, universalPoolDir);
   } else if (provider.driver === "claudeAgent") {
+    driverGroupKey = "claudeAgent";
+    driverGroupLabel = "Claude";
+    readsUniversalPool = false;
+    writableGlobalSkillDir = NodePath.join(userHome, ".claude", "skills");
     pushUnique(dirs, NodePath.join(userHome, ".claude", "skills"));
   } else if (provider.driver === "cursor") {
+    driverGroupKey = "cursor";
+    driverGroupLabel = "Cursor";
+    readsUniversalPool = false;
+    writableGlobalSkillDir = NodePath.join(userHome, ".cursor", "skills");
     pushUnique(dirs, NodePath.join(userHome, ".cursor", "skills"));
   } else if (provider.driver === "opencode") {
+    driverGroupKey = "opencode";
+    driverGroupLabel = "OpenCode";
+    readsUniversalPool = true;
+    writableGlobalSkillDir = NodePath.join(userHome, ".config", "opencode", "skills");
     pushUnique(dirs, NodePath.join(userHome, ".config", "opencode", "skills"));
+    pushUnique(dirs, universalPoolDir);
   } else if (provider.driver === "pi") {
+    driverGroupKey = "pi";
+    driverGroupLabel = "Pi";
+    readsUniversalPool = true;
+    writableGlobalSkillDir = NodePath.join(userHome, ".pi", "agent", "skills");
     pushUnique(dirs, NodePath.join(userHome, ".pi", "agent", "skills"));
+    pushUnique(dirs, universalPoolDir);
   } else {
-    pushUnique(dirs, NodePath.join(userHome, ".agents", "skills"));
+    readsUniversalPool = true;
+    writableGlobalSkillDir = universalPoolDir;
+    pushUnique(dirs, universalPoolDir);
   }
 
   return {
+    driverGroupKey,
+    driverGroupLabel,
     dirs,
-    manifestEntryDirs,
+    writableGlobalSkillDir,
+    readsUniversalPool,
+    manifestEntries,
     ...(factoryHomeOverride !== undefined ? { factoryHomeOverride } : {}),
     isFactoryDroid,
-    antigravityConfigSkillsDirs,
   };
 }
 
-function runtimeSkillsForProvider(
-  provider: ServerProvider,
-  cwd?: string,
-): ReadonlyArray<{ readonly skill: ServerProviderSkill; readonly fromWorkspace: boolean }> {
-  const byName = new Map<
-    string,
-    { readonly skill: ServerProviderSkill; readonly fromWorkspace: boolean }
-  >();
-  for (const skill of provider.skills) {
-    byName.set(skill.name, { skill, fromWorkspace: false });
-  }
-  if (cwd) {
-    const normalizedCwd = NodePath.resolve(cwd).toLowerCase();
-    const workspace = provider.workspaceSnapshots?.find(
-      (snapshot) => NodePath.resolve(snapshot.cwd).toLowerCase() === normalizedCwd,
-    );
-    for (const skill of workspace?.skills ?? []) {
-      if (!byName.has(skill.name)) {
-        byName.set(skill.name, { skill, fromWorkspace: true });
-      }
-    }
-  }
-  return [...byName.values()];
-}
-
-function isPathInside(candidatePath: string, rootDir: string): boolean {
-  const normalizedCandidate = NodePath.resolve(candidatePath).toLowerCase();
-  const normalizedRoot = NodePath.resolve(rootDir).toLowerCase();
-  return (
-    normalizedCandidate === normalizedRoot ||
-    normalizedCandidate.startsWith(`${normalizedRoot}${NodePath.sep}`)
-  );
+function isBetterDiskCandidate(
+  existing: DiscoveredDiskSkill | undefined,
+  incoming: DiscoveredDiskSkill,
+): boolean {
+  if (!existing) return true;
+  // Prefer valid absolute skills.json entry over non-absolute or bare junction.
+  const score = (skill: DiscoveredDiskSkill): number => {
+    if (skill.fromSkillsJson && !skill.manifestPathNonAbsolute) return 4;
+    if (!skill.linkTarget && !skill.manifestPathNonAbsolute) return 3;
+    if (skill.fromSkillsJson) return 2;
+    return 1;
+  };
+  return score(incoming) > score(existing);
 }
 
 const SCOPE_ORDER: Readonly<Record<SkillMatrixScope, number>> = {
-  global: 0,
-  workspace: 1,
+  universal: 0,
+  agent_global: 1,
   builtin: 2,
 };
 
@@ -381,16 +467,21 @@ export const buildSkillsOverview = Effect.fn("SkillsOverview.build")(function* (
   return yield* Effect.tryPromise({
     try: async (): Promise<ServerGetSkillsOverviewResult> => {
       const diagnostics: Array<SkillMatrixDiagnostic> = [];
+      const seenDiagnostics = new Set<string>();
+      const pushDiagnostic = (diagnostic: SkillMatrixDiagnostic) => {
+        const key = `${diagnostic.code}:${diagnostic.message}:${diagnostic.detail ?? ""}`;
+        if (seenDiagnostics.has(key)) return;
+        seenDiagnostics.add(key);
+        diagnostics.push(diagnostic);
+      };
 
       // Diagnostic 1: Windows PATH entries mixing forward/back slashes (e.g. ego-browser installer bug)
       if (platform === "win32" && envPath) {
-        const seenBad = new Set<string>();
         for (const rawEntry of envPath.split(";")) {
           const entry = rawEntry.trim();
           if (entry.length === 0) continue;
-          if (entry.includes("/") && entry.includes("\\") && !seenBad.has(entry)) {
-            seenBad.add(entry);
-            diagnostics.push({
+          if (entry.includes("/") && entry.includes("\\")) {
+            pushDiagnostic({
               severity: "warning",
               code: "path_mixed_slashes",
               message: "环境变量 PATH 中存在正反斜杠混用路径，可能导致 CLI 技能命令无法识别",
@@ -400,27 +491,45 @@ export const buildSkillsOverview = Effect.fn("SkillsOverview.build")(function* (
         }
       }
 
-      // Scan universal ~/.agents/skills pool
-      const universalPoolDir = NodePath.join(userHome, ".agents", "skills");
+      // Scan universal ~/.agents/skills pool (true cross-agent global layer)
+      const universalPoolDir = NodePath.resolve(NodePath.join(userHome, ".agents", "skills"));
       const universalSkills = await scanSkillsDirectory(universalPoolDir);
+      const universalSkillNames = new Set<string>(universalSkills.map((skill) => skill.name));
 
       // Scan default ~/.factory/skills once for Factory isolated profile diagnostic
       const defaultFactorySkillsDir = NodePath.join(userHome, ".factory", "skills");
       const defaultFactorySkills = await scanSkillsDirectory(defaultFactorySkillsDir);
 
+      const specsByInstanceId = new Map<string, InstanceSkillSpec>();
+      for (const provider of input.providers) {
+        const spec = await resolveInstanceSkillSpec({
+          provider,
+          settings: input.settings,
+          stateDir: input.stateDir,
+          userHome,
+          platform,
+        });
+        specsByInstanceId.set(provider.instanceId, spec);
+      }
+
+      // Sort instances: enabled first, grouped by driverGroupLabel, then displayName
+      const sortedProviders = [...input.providers].toSorted((a, b) => {
+        if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+        const groupA = specsByInstanceId.get(a.instanceId)?.driverGroupLabel ?? a.driver;
+        const groupB = specsByInstanceId.get(b.instanceId)?.driverGroupLabel ?? b.driver;
+        const groupCmp = groupA.localeCompare(groupB);
+        if (groupCmp !== 0) return groupCmp;
+        return (a.displayName ?? a.instanceId).localeCompare(b.displayName ?? b.instanceId);
+      });
+
       const instances: Array<SkillMatrixInstance> = [];
       const diskSkillsByInstance = new Map<string, Map<string, DiscoveredDiskSkill>>();
-      const runtimeSkillsByInstance = new Map<
-        string,
-        Map<string, { readonly skill: ServerProviderSkill; readonly fromWorkspace: boolean }>
-      >();
-      const instanceDirInfoById = new Map<string, InstanceSkillDirsInfo>();
+      const runtimeSkillsByInstance = new Map<string, Map<string, ServerProviderSkill>>();
 
-      const allGlobalSkillNames = new Set<string>(universalSkills.map((skill) => skill.name));
-      const allSkillMeta = new Map<
-        string,
-        { description?: string; canonicalPath?: string; fromWorkspace?: boolean }
-      >();
+      const agentGlobalOwnerGroups = new Map<string, Set<string>>();
+      const builtinOwnerGroups = new Map<string, Set<string>>();
+      const groupLabelByKey = new Map<string, string>();
+      const allSkillMeta = new Map<string, { description?: string; canonicalPath?: string }>();
 
       for (const skill of universalSkills) {
         allSkillMeta.set(skill.name, {
@@ -429,41 +538,59 @@ export const buildSkillsOverview = Effect.fn("SkillsOverview.build")(function* (
         });
       }
 
-      const sortedProviders = [...input.providers].toSorted((a, b) => {
-        if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
-        return (a.displayName ?? a.instanceId).localeCompare(b.displayName ?? b.instanceId);
-      });
-
       for (const provider of sortedProviders) {
-        const dirInfo = await resolveInstanceSkillDirs({
-          provider,
-          settings: input.settings,
-          stateDir: input.stateDir,
-          userHome,
-        });
-        instanceDirInfoById.set(provider.instanceId, dirInfo);
+        const spec = specsByInstanceId.get(provider.instanceId)!;
+        groupLabelByKey.set(spec.driverGroupKey, spec.driverGroupLabel);
 
         instances.push({
           instanceId: provider.instanceId,
           driver: provider.driver,
+          driverGroupKey: spec.driverGroupKey,
+          driverGroupLabel: spec.driverGroupLabel,
           displayName: provider.displayName?.trim() || provider.instanceId,
           enabled: provider.enabled,
           installed: provider.installed,
           status: provider.status,
-          globalSkillDirs: [...dirInfo.dirs],
+          readsUniversalPool: spec.readsUniversalPool,
+          globalSkillDirs: [...spec.dirs],
+          writableGlobalSkillDir: spec.writableGlobalSkillDir,
         });
 
+        const manifestByDir = new Map<string, ManifestEntryScan>(
+          spec.manifestEntries.map((entry) => [entry.resolvedDir.toLowerCase(), entry]),
+        );
+
+        // Diagnostic: Antigravity skills.json with non-absolute ~/ path on Windows
+        if (provider.enabled && provider.driver === "antigravity") {
+          for (const entry of spec.manifestEntries) {
+            if (entry.nonAbsoluteOnWindows) {
+              pushDiagnostic({
+                severity: "warning",
+                code: "antigravity_skills_json_non_absolute",
+                message: "Antigravity 的 skills.json 在 Windows 上不支持 ~/ 写法，必须使用绝对路径",
+                detail: `当前配置 "${entry.rawPath}" 会被底层拒绝；请改为 "${entry.resolvedDir.replace(/\\/g, "/")}"`,
+              });
+            }
+          }
+        }
+
         const diskMap = new Map<string, DiscoveredDiskSkill>();
-        const manifestDirSet = new Set(dirInfo.manifestEntryDirs.map((dir) => dir.toLowerCase()));
-        for (const dir of dirInfo.dirs) {
-          const fromSkillsJson = manifestDirSet.has(dir.toLowerCase());
-          const scanned = await scanSkillsDirectory(dir, { fromSkillsJson });
+        for (const dir of spec.dirs) {
+          const manifestEntry = manifestByDir.get(dir.toLowerCase());
+          const scanned = await scanSkillsDirectory(dir, {
+            ...(manifestEntry ? { fromSkillsJson: true } : {}),
+            ...(manifestEntry?.nonAbsoluteOnWindows ? { manifestPathNonAbsolute: true } : {}),
+          });
           for (const skill of scanned) {
-            allGlobalSkillNames.add(skill.name);
             const existing = diskMap.get(skill.name);
-            // Prefer entries coming from explicit skills.json over bare junctions
-            if (!existing || (!existing.fromSkillsJson && skill.fromSkillsJson)) {
+            if (isBetterDiskCandidate(existing, skill)) {
               diskMap.set(skill.name, skill);
+            }
+            // If this skill is NOT in ~/.agents/skills, record it as owned by this driver group.
+            if (!universalSkillNames.has(skill.name)) {
+              const owners = agentGlobalOwnerGroups.get(skill.name) ?? new Set<string>();
+              owners.add(spec.driverGroupKey);
+              agentGlobalOwnerGroups.set(skill.name, owners);
             }
             const meta = allSkillMeta.get(skill.name) ?? {};
             if (!meta.description && skill.description) {
@@ -477,128 +604,189 @@ export const buildSkillsOverview = Effect.fn("SkillsOverview.build")(function* (
         }
         diskSkillsByInstance.set(provider.instanceId, diskMap);
 
-        const runtimeList = runtimeSkillsForProvider(provider, input.cwd);
-        const runtimeMap = new Map<
-          string,
-          { readonly skill: ServerProviderSkill; readonly fromWorkspace: boolean }
-        >();
-        for (const item of runtimeList) {
-          runtimeMap.set(item.skill.name, item);
-          const meta = allSkillMeta.get(item.skill.name) ?? {};
-          if (!meta.description && item.skill.description) {
-            meta.description = item.skill.description;
+        // Runtime skills (global only — deliberately ignore workspaceSnapshots to stay focused on global layer)
+        const runtimeMap = new Map<string, ServerProviderSkill>();
+        for (const skill of provider.skills) {
+          runtimeMap.set(skill.name, skill);
+          if (!universalSkillNames.has(skill.name) && !agentGlobalOwnerGroups.has(skill.name)) {
+            const owners = builtinOwnerGroups.get(skill.name) ?? new Set<string>();
+            owners.add(spec.driverGroupKey);
+            builtinOwnerGroups.set(skill.name, owners);
           }
-          if (!meta.canonicalPath && item.skill.path) {
-            meta.canonicalPath = item.skill.path;
+          const meta = allSkillMeta.get(skill.name) ?? {};
+          if (!meta.description && skill.description) {
+            meta.description = skill.description;
           }
-          if (item.fromWorkspace && input.cwd && isPathInside(item.skill.path, input.cwd)) {
-            meta.fromWorkspace = true;
+          if (!meta.canonicalPath && skill.path) {
+            meta.canonicalPath = skill.path;
           }
-          allSkillMeta.set(item.skill.name, meta);
+          allSkillMeta.set(skill.name, meta);
         }
         runtimeSkillsByInstance.set(provider.instanceId, runtimeMap);
 
-        // Diagnostic 2: Factory Droid isolated profile missing .factory/skills
-        if (
-          provider.enabled &&
-          dirInfo.isFactoryDroid &&
-          dirInfo.factoryHomeOverride !== undefined &&
-          defaultFactorySkills.length > 0
-        ) {
-          const isolatedSkillsDir = NodePath.join(
-            dirInfo.factoryHomeOverride,
+        // Diagnostic 2: Factory Droid isolated profile missing .factory/skills or .agents/skills
+        if (provider.enabled && spec.isFactoryDroid && spec.factoryHomeOverride !== undefined) {
+          const isolatedFactorySkills = NodePath.join(
+            spec.factoryHomeOverride,
             ".factory",
             "skills",
           );
-          if (!(await pathExists(isolatedSkillsDir))) {
-            diagnostics.push({
+          if (defaultFactorySkills.length > 0 && !(await pathExists(isolatedFactorySkills))) {
+            pushDiagnostic({
               severity: "warning",
               code: "isolated_profile_missing_skills",
-              message: `隔离实例 ${provider.displayName ?? provider.instanceId} 缺少全局技能目录`,
-              detail: `${isolatedSkillsDir} 不存在（默认目录 ${defaultFactorySkillsDir} 含 ${defaultFactorySkills.length} 个技能）`,
+              message: `隔离实例 ${provider.displayName ?? provider.instanceId} 缺少 .factory/skills 目录`,
+              detail: `${isolatedFactorySkills} 不存在（默认目录 ${defaultFactorySkillsDir} 含 ${defaultFactorySkills.length} 个技能）`,
+            });
+          }
+          const isolatedAgentsSkills = NodePath.join(spec.factoryHomeOverride, ".agents", "skills");
+          if (universalSkills.length > 0 && !(await pathExists(isolatedAgentsSkills))) {
+            pushDiagnostic({
+              severity: "info",
+              code: "isolated_profile_no_universal_pool",
+              message: `隔离实例 ${provider.displayName ?? provider.instanceId} 未联接真全局池 ~/.agents/skills`,
+              detail: `设置了 FACTORY_HOME_OVERRIDE 后 Droid 会扫描 ${isolatedAgentsSkills} 而非 ${universalPoolDir}`,
             });
           }
         }
 
-        // Diagnostic 3: Antigravity junction inside config/skills without skills.json entry
-        if (provider.enabled && provider.driver === "antigravity") {
+        // Diagnostic 3: Antigravity Windows junction inside config/skills without valid absolute skills.json entry
+        if (provider.enabled && provider.driver === "antigravity" && platform === "win32") {
           for (const [skillName, diskSkill] of diskMap.entries()) {
             const runtimeEntry = runtimeMap.get(skillName);
-            const isActiveRuntime = runtimeEntry !== undefined && runtimeEntry.skill.enabled;
-            if (isActiveRuntime || diskSkill.fromSkillsJson) continue;
+            const isActiveRuntime = runtimeEntry !== undefined && runtimeEntry.enabled;
+            if (isActiveRuntime) continue;
+            if (diskSkill.fromSkillsJson && !diskSkill.manifestPathNonAbsolute) continue;
             if (diskSkill.linkTarget !== undefined) {
-              diagnostics.push({
+              pushDiagnostic({
                 severity: "warning",
                 code: "antigravity_junction_without_manifest",
-                message: `Antigravity 实例 ${provider.displayName ?? provider.instanceId} 的技能 ${skillName} 通过目录联接挂载，可能未被加载`,
-                detail: `建议在 ~/.gemini/config/skills.json 的 entries 中显式指向其真实父目录（当前联接目标：${diskSkill.linkTarget}）`,
+                message: `Antigravity 实例 ${provider.displayName ?? provider.instanceId} 的技能 ${skillName} 通过目录联接挂载，Windows 扫描会跳过`,
+                detail: `请在 ~/.gemini/config/skills.json 的 entries 中使用绝对路径指向其真实父目录（当前联接目标：${diskSkill.linkTarget}）`,
               });
             }
           }
         }
       }
 
-      const enabledInstanceIds = instances
-        .filter((instance) => instance.enabled)
-        .map((instance) => instance.instanceId);
-      const totalEnabledCount = NonNegativeInt.make(enabledInstanceIds.length);
-
       const skills: Array<SkillMatrixEntry> = [];
       for (const [skillName, meta] of allSkillMeta.entries()) {
-        const scope: SkillMatrixScope = allGlobalSkillNames.has(skillName)
-          ? "global"
-          : meta.fromWorkspace
-            ? "workspace"
+        const isUniversal = universalSkillNames.has(skillName);
+        const agentOwners = agentGlobalOwnerGroups.get(skillName);
+        const builtinOwners = builtinOwnerGroups.get(skillName);
+
+        const scope: SkillMatrixScope = isUniversal
+          ? "universal"
+          : agentOwners && agentOwners.size > 0
+            ? "agent_global"
             : "builtin";
+
+        const ownerGroupKeys =
+          scope === "universal"
+            ? null
+            : scope === "agent_global"
+              ? (agentOwners ?? new Set<string>())
+              : (builtinOwners ?? new Set<string>());
+        const ownerGroupLabels =
+          ownerGroupKeys === null
+            ? []
+            : [...ownerGroupKeys]
+                .map((key) => groupLabelByKey.get(key) ?? key)
+                .toSorted((a, b) => a.localeCompare(b));
 
         const cells: Record<string, SkillMatrixCell> = {};
         let coveredEnabled = 0;
+        let expectedEnabled = 0;
 
         for (const instance of instances) {
+          const spec = specsByInstanceId.get(instance.instanceId)!;
           const runtimeEntry = runtimeSkillsByInstance.get(instance.instanceId)?.get(skillName);
           const diskEntry = diskSkillsByInstance.get(instance.instanceId)?.get(skillName);
-          const dirInfo = instanceDirInfoById.get(instance.instanceId);
+
+          const isExpectedHere =
+            scope === "universal" ||
+            (ownerGroupKeys !== null && ownerGroupKeys.has(spec.driverGroupKey));
 
           let cell: SkillMatrixCell;
-          if (runtimeEntry !== undefined && runtimeEntry.skill.enabled) {
+          if (runtimeEntry !== undefined && runtimeEntry.enabled) {
             cell = {
-              status: "active",
-              path: runtimeEntry.skill.path,
-              ...(diskEntry?.linkTarget !== undefined ? { linkTarget: diskEntry.linkTarget } : {}),
+              status: "declared_runtime",
+              path: runtimeEntry.path,
+              ...(diskEntry?.sourceDir ? { sourceDir: diskEntry.sourceDir } : {}),
+              ...(diskEntry?.linkTarget ? { linkTarget: diskEntry.linkTarget } : {}),
             };
           } else if (diskEntry !== undefined) {
-            let reason: string;
-            if (instance.driver === "antigravity" && diskEntry.fromSkillsJson) {
-              reason = "已通过 skills.json 显式注册（重启或新建会话后在运行态生效）";
-            } else if (instance.driver === "antigravity" && diskEntry.linkTarget !== undefined) {
-              reason = "通过目录联接挂载，建议在 skills.json 中声明以确保 Antigravity 加载";
-            } else if (instance.driver === "acpRegistry") {
-              reason = "磁盘目录存在（该驱动未在状态快照中上报技能列表）";
+            const hasWindowsAgyJunctionCaveat =
+              instance.driver === "antigravity" &&
+              platform === "win32" &&
+              diskEntry.linkTarget !== undefined &&
+              (!diskEntry.fromSkillsJson || diskEntry.manifestPathNonAbsolute === true);
+            const hasNonAbsoluteManifest =
+              instance.driver === "antigravity" && diskEntry.manifestPathNonAbsolute === true;
+            const missingFrontmatter = !diskEntry.hasValidFrontmatter;
+
+            if (hasNonAbsoluteManifest) {
+              cell = {
+                status: "disk_warning",
+                path: diskEntry.skillMdPath,
+                sourceDir: diskEntry.sourceDir,
+                ...(diskEntry.linkTarget ? { linkTarget: diskEntry.linkTarget } : {}),
+                reason: "skills.json 使用了 ~/ 路径，Windows 版 Antigravity 要求绝对路径",
+              };
+            } else if (hasWindowsAgyJunctionCaveat) {
+              cell = {
+                status: "disk_warning",
+                path: diskEntry.skillMdPath,
+                sourceDir: diskEntry.sourceDir,
+                ...(diskEntry.linkTarget ? { linkTarget: diskEntry.linkTarget } : {}),
+                reason: "Windows 目录联接会被 Antigravity 跳过，需通过 skills.json 绝对路径注册",
+              };
+            } else if (missingFrontmatter) {
+              cell = {
+                status: "disk_warning",
+                path: diskEntry.skillMdPath,
+                sourceDir: diskEntry.sourceDir,
+                ...(diskEntry.linkTarget ? { linkTarget: diskEntry.linkTarget } : {}),
+                reason: "SKILL.md 缺少合法 YAML frontmatter（name / description）",
+              };
             } else {
-              reason = "磁盘目录存在（未在当前运行态快照中上报）";
+              const reason =
+                instance.driver === "antigravity" && diskEntry.fromSkillsJson
+                  ? "已通过 skills.json 绝对路径注册（新建会话后生效）"
+                  : `已位于扫描目录 ${diskEntry.sourceDir}（该驱动快照未上报技能列表）`;
+              cell = {
+                status: "declared_disk",
+                path: diskEntry.skillMdPath,
+                sourceDir: diskEntry.sourceDir,
+                ...(diskEntry.linkTarget ? { linkTarget: diskEntry.linkTarget } : {}),
+                reason,
+              };
             }
-            cell = {
-              status: "disk_only",
-              path: diskEntry.skillMdPath,
-              ...(diskEntry.linkTarget !== undefined ? { linkTarget: diskEntry.linkTarget } : {}),
-              reason,
-            };
-          } else if (scope === "global") {
-            const expectedDir = dirInfo?.dirs[0];
+          } else if (isExpectedHere) {
+            const reason =
+              scope === "universal" && !spec.readsUniversalPool
+                ? `该实例不自动扫描 ~/.agents/skills，且未挂载到 ${spec.writableGlobalSkillDir}`
+                : `未在 ${spec.dirs.join(" 或 ")} 中找到`;
             cell = {
               status: "missing",
-              ...(expectedDir !== undefined ? { reason: `未在 ${expectedDir} 中找到` } : {}),
+              reason,
             };
           } else {
             cell = {
               status: "not_applicable",
-              reason: "其他驱动或工作区私有技能",
+              reason:
+                ownerGroupLabels.length > 0
+                  ? `仅归属 ${ownerGroupLabels.join(" / ")}，本驱动不适用`
+                  : "其他驱动专属技能",
             };
           }
 
           cells[instance.instanceId] = cell;
-          if (instance.enabled && (cell.status === "active" || cell.status === "disk_only")) {
-            coveredEnabled += 1;
+          if (instance.enabled && isExpectedHere) {
+            expectedEnabled += 1;
+            if (cell.status === "declared_runtime" || cell.status === "declared_disk") {
+              coveredEnabled += 1;
+            }
           }
         }
 
@@ -606,9 +794,10 @@ export const buildSkillsOverview = Effect.fn("SkillsOverview.build")(function* (
           name: skillName,
           ...(meta.description !== undefined ? { description: meta.description } : {}),
           scope,
+          ownerGroupLabels,
           ...(meta.canonicalPath !== undefined ? { canonicalPath: meta.canonicalPath } : {}),
           coveredEnabledCount: NonNegativeInt.make(coveredEnabled),
-          totalEnabledCount,
+          expectedEnabledCount: NonNegativeInt.make(expectedEnabled),
           cells,
         });
       }
@@ -616,16 +805,15 @@ export const buildSkillsOverview = Effect.fn("SkillsOverview.build")(function* (
       skills.sort((a, b) => {
         const scopeDiff = SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope];
         if (scopeDiff !== 0) return scopeDiff;
-        if (a.scope === "global") {
-          const missingA = a.totalEnabledCount - a.coveredEnabledCount;
-          const missingB = b.totalEnabledCount - b.coveredEnabledCount;
-          if (missingA !== missingB) return missingB - missingA;
-        }
+        const missingA = a.expectedEnabledCount - a.coveredEnabledCount;
+        const missingB = b.expectedEnabledCount - b.coveredEnabledCount;
+        if (missingA !== missingB) return missingB - missingA;
         return a.name.localeCompare(b.name);
       });
 
       return {
         checkedAt,
+        universalPoolDir,
         instances,
         skills,
         diagnostics,

@@ -53,11 +53,11 @@ async function writeSkill(rootDir: string, folderName: string, name: string, des
 
 describe("buildSkillsOverview", () => {
   it.effect(
-    "detects global skill coverage, isolated Factory profile gaps, Antigravity skills.json entries, builtin scoping, and Windows PATH slash warnings",
+    "separates universal pool vs agent-specific global vs builtin, flags non-absolute Windows skills.json, and ignores backup dirs",
     () =>
       Effect.gen(function* () {
         const tempRoot = yield* Effect.promise(() =>
-          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-skills-overview-")),
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-skills-overview-v2-")),
         );
         return yield* Effect.ensuring(
           Effect.gen(function* () {
@@ -65,7 +65,7 @@ describe("buildSkillsOverview", () => {
             const stateDir = NodePath.join(tempRoot, "state");
             const w2Home = NodePath.join(tempRoot, "factory-w2");
 
-            // Universal pool + W1 Factory Droid have ego-browser; W2 isolated profile lacks .factory/skills
+            // 1. Universal pool: ego-browser + tdd + ignored backup dir
             yield* Effect.promise(() =>
               writeSkill(
                 NodePath.join(userHome, ".agents", "skills"),
@@ -76,6 +76,25 @@ describe("buildSkillsOverview", () => {
             );
             yield* Effect.promise(() =>
               writeSkill(
+                NodePath.join(userHome, ".agents", "skills"),
+                "tdd",
+                "tdd",
+                "Test-driven development",
+              ),
+            );
+            yield* Effect.promise(() =>
+              writeSkill(
+                NodePath.join(userHome, ".agents", "skills"),
+                "old.backup-2026",
+                "old-backup",
+                "Should be ignored",
+              ),
+            );
+
+            // 2. Factory W1 has ego-browser in .factory/skills (plus reads ~/.agents/skills for tdd)
+            //    W2 has FACTORY_HOME_OVERRIDE with no .factory/skills and no .agents/skills
+            yield* Effect.promise(() =>
+              writeSkill(
                 NodePath.join(userHome, ".factory", "skills"),
                 "ego-browser",
                 "ego-browser",
@@ -83,21 +102,33 @@ describe("buildSkillsOverview", () => {
               ),
             );
 
-            // Antigravity skills.json points to ~/custom-skills which contains ego-browser
+            // 3. Codex-only agent_global skill: should NOT mark AGY/W1/W2 as missing!
             yield* Effect.promise(() =>
               writeSkill(
-                NodePath.join(userHome, "custom-skills"),
-                "ego-browser",
-                "ego-browser",
-                "Browser automation skill",
+                NodePath.join(userHome, ".codex", "skills"),
+                "codex-only",
+                "codex-only",
+                "Codex specific skill",
               ),
+            );
+
+            // 4. Antigravity skills.json with absolute path for ego-browser AND non-absolute ~/ for broken-dir
+            const absCustomDir = NodePath.join(userHome, "abs-ego-skills");
+            yield* Effect.promise(() =>
+              writeSkill(absCustomDir, "ego-browser", "ego-browser", "Browser automation skill"),
+            );
+            const tildeCustomDir = NodePath.join(userHome, "tilde-skills");
+            yield* Effect.promise(() =>
+              writeSkill(tildeCustomDir, "tilde-only", "tilde-only", "Tilde registered skill"),
             );
             const geminiConfigDir = NodePath.join(userHome, ".gemini", "config");
             yield* Effect.promise(() => NodeFSP.mkdir(geminiConfigDir, { recursive: true }));
             yield* Effect.promise(() =>
               NodeFSP.writeFile(
                 NodePath.join(geminiConfigDir, "skills.json"),
-                JSON.stringify({ entries: [{ path: "~/custom-skills" }] }),
+                JSON.stringify({
+                  entries: [{ path: absCustomDir }, { path: "~/tilde-skills" }],
+                }),
                 "utf8",
               ),
             );
@@ -146,6 +177,19 @@ describe("buildSkillsOverview", () => {
                 driver: "acpRegistry",
                 displayName: "W2",
               }),
+              makeProvider({
+                instanceId: "codex",
+                driver: "codex",
+                displayName: "Codex",
+                skills: [
+                  {
+                    name: "codex-only",
+                    description: "Codex specific skill",
+                    path: NodePath.join(userHome, ".codex", "skills", "codex-only", "SKILL.md"),
+                    enabled: true,
+                  },
+                ],
+              }),
             ];
 
             const overview = yield* buildSkillsOverview({
@@ -157,25 +201,60 @@ describe("buildSkillsOverview", () => {
               platform: "win32",
             });
 
+            // Ignored backup dir must not appear
+            expect(overview.skills.find((entry) => entry.name === "old-backup")).toBeUndefined();
+
+            // Universal skill: ego-browser (AGY via abs skills.json, W1 via .factory/skills, Codex via ~/.agents/skills; W2 missing)
             const ego = overview.skills.find((entry) => entry.name === "ego-browser");
-            expect(ego).toBeDefined();
-            expect(ego?.scope).toBe("global");
-            expect(ego?.coveredEnabledCount).toBe(2);
-            expect(ego?.totalEnabledCount).toBe(3);
-            expect(ego?.cells.antigravity?.status).toBe("disk_only");
-            expect(ego?.cells.antigravity?.reason).toContain("skills.json");
-            expect(ego?.cells.W1?.status).toBe("disk_only");
+            expect(ego?.scope).toBe("universal");
+            expect(ego?.coveredEnabledCount).toBe(3);
+            expect(ego?.expectedEnabledCount).toBe(4);
+            expect(ego?.cells.antigravity?.status).toBe("declared_disk");
+            expect(ego?.cells.W1?.status).toBe("declared_disk");
+            expect(ego?.cells.codex?.status).toBe("declared_disk");
             expect(ego?.cells.W2?.status).toBe("missing");
 
+            // Universal skill: tdd (W1 & Codex read ~/.agents/skills; AGY & isolated W2 do not!)
+            const tdd = overview.skills.find((entry) => entry.name === "tdd");
+            expect(tdd?.scope).toBe("universal");
+            expect(tdd?.cells.W1?.status).toBe("declared_disk");
+            expect(tdd?.cells.codex?.status).toBe("declared_disk");
+            expect(tdd?.cells.antigravity?.status).toBe("missing");
+            expect(tdd?.cells.W2?.status).toBe("missing");
+
+            // Agent-specific global skill: codex-only (only Codex expects it; AGY/W1/W2 are not_applicable!)
+            const codexOnly = overview.skills.find((entry) => entry.name === "codex-only");
+            expect(codexOnly?.scope).toBe("agent_global");
+            expect(codexOnly?.ownerGroupLabels).toEqual(["Codex"]);
+            expect(codexOnly?.coveredEnabledCount).toBe(1);
+            expect(codexOnly?.expectedEnabledCount).toBe(1);
+            expect(codexOnly?.cells.codex?.status).toBe("declared_runtime");
+            expect(codexOnly?.cells.antigravity?.status).toBe("not_applicable");
+            expect(codexOnly?.cells.W1?.status).toBe("not_applicable");
+            expect(codexOnly?.cells.W2?.status).toBe("not_applicable");
+
+            // Non-absolute ~/ path in Windows Antigravity skills.json -> disk_warning + diagnostic!
+            const tildeOnly = overview.skills.find((entry) => entry.name === "tilde-only");
+            expect(tildeOnly?.scope).toBe("agent_global");
+            expect(tildeOnly?.cells.antigravity?.status).toBe("disk_warning");
+            expect(tildeOnly?.cells.antigravity?.reason).toContain("绝对路径");
+
+            // Builtin skill
             const agyBuiltin = overview.skills.find((entry) => entry.name === "agy-customizations");
             expect(agyBuiltin?.scope).toBe("builtin");
-            expect(agyBuiltin?.cells.antigravity?.status).toBe("active");
+            expect(agyBuiltin?.cells.antigravity?.status).toBe("declared_runtime");
             expect(agyBuiltin?.cells.W1?.status).toBe("not_applicable");
-            expect(agyBuiltin?.cells.W2?.status).toBe("not_applicable");
 
+            // Diagnostics
             expect(overview.diagnostics.some((d) => d.code === "path_mixed_slashes")).toBe(true);
             expect(
               overview.diagnostics.some((d) => d.code === "isolated_profile_missing_skills"),
+            ).toBe(true);
+            expect(
+              overview.diagnostics.some((d) => d.code === "isolated_profile_no_universal_pool"),
+            ).toBe(true);
+            expect(
+              overview.diagnostics.some((d) => d.code === "antigravity_skills_json_non_absolute"),
             ).toBe(true);
           }),
           Effect.promise(() => NodeFSP.rm(tempRoot, { recursive: true, force: true })),
