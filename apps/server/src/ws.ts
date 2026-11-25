@@ -2489,6 +2489,27 @@ export const layerWsRpc = (
                 .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError)),
             ),
           ),
+        [WS_METHODS.serverProbeAcpModelOptions]: Effect.fn("WsServer.probeAcpModelOptions")(
+          function* (input) {
+            const { manager } = yield* acpRegistrySessions.sessionManager(input.instanceId);
+            if (!manager.probeModelOptions) {
+              return yield* new AcpRegistryOperationError({
+                reason: "probe_failed",
+                message: "This ACP provider does not support probing model options.",
+              });
+            }
+            const project =
+              input.projectId === undefined
+                ? null
+                : yield* acpRegistrySessions
+                    .project(input.projectId)
+                    .pipe(Effect.orElseSucceed(() => null));
+            return yield* manager.probeModelOptions({
+              ...(project === null ? {} : { cwd: project.workspaceRoot }),
+              modelIds: input.modelIds,
+            });
+          },
+        ),
         [WS_METHODS.serverUninstallAcpRegistryManagedBinary]: (input) =>
           Effect.annotateCurrentSpan({ "acp_registry.agent_id": input.agentId }).pipe(
             Effect.andThen(

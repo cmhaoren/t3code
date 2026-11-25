@@ -31,6 +31,15 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { AcpRegistryAdapterV2Driver, type AcpRegistryAdapterV2DriverEnv } from "./adapter.ts";
+import {
+  applyLearnedModelOptionsToModels,
+  extractLearnedModelOptions,
+  mergeFamilyModelOptions,
+  mergeLearnedModelOptionsMaps,
+  readFamilyModelOptions,
+  resolveAcpRegistryFamilyKey,
+  type LearnedModelOptionsBySlug,
+} from "./modelOptionsStore.ts";
 import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
@@ -66,6 +75,7 @@ import {
   listAcpRegistryProviders,
   logoutAcpRegistry,
   probeAcpRegistryConfiguration,
+  probeAcpRegistryModelOptions,
   setAcpRegistryProvider,
 } from "./probe.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
@@ -835,8 +845,69 @@ export const AcpRegistryDriver: ProviderDriver<
             );
           });
     // Refreshes rebuild the snapshot from the probe, so per-model options
-    // learned from earlier sessions are kept here.
+    // learned from earlier sessions are kept here, persisted to disk, and synced
+    // across sibling instances of the same ACP agent family.
+    const familyKey = resolveAcpRegistryFamilyKey(effectiveConfig);
+    const initialPersistedLearned = yield* readFamilyModelOptions({
+      cacheDir: host.paths.providerStatusCacheDir,
+      familyKey,
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.orElseSucceed(() => ({}) as LearnedModelOptionsBySlug),
+    );
+    const initialSharedLearned =
+      Option.isSome(runtimeCoordinator) && familyKey
+        ? yield* runtimeCoordinator.value.getLearnedModelOptions(familyKey)
+        : ({} as LearnedModelOptionsBySlug);
+    const learnedModelOptions = yield* Ref.make<LearnedModelOptionsBySlug>(
+      mergeLearnedModelOptionsMaps(initialPersistedLearned, initialSharedLearned, {
+        preferIncoming: true,
+      }),
+    );
     const learnedModels = yield* Ref.make<ReadonlyArray<ServerProviderModel>>([]);
+    const recordLearnedOptions = Effect.fn("AcpRegistryDriver.recordLearnedOptions")(function* (
+      updates: LearnedModelOptionsBySlug,
+      options?: { readonly preferIncoming?: boolean; readonly broadcast?: boolean },
+    ) {
+      if (Object.keys(updates).length === 0) return;
+      const merged = yield* Ref.modify(learnedModelOptions, (current) => {
+        const next = mergeLearnedModelOptionsMaps(
+          current,
+          updates,
+          options?.preferIncoming === undefined
+            ? undefined
+            : { preferIncoming: options.preferIncoming },
+        );
+        const changed = JSON.stringify(next) !== JSON.stringify(current);
+        return [changed ? next : null, changed ? next : current] as const;
+      });
+      if (merged === null) return;
+      if (familyKey) {
+        yield* mergeFamilyModelOptions({
+          cacheDir: host.paths.providerStatusCacheDir,
+          familyKey,
+          updates,
+          ...(options?.preferIncoming === undefined
+            ? {}
+            : { preferIncoming: options.preferIncoming }),
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.ignore,
+        );
+        if (options?.broadcast !== false && Option.isSome(runtimeCoordinator)) {
+          yield* runtimeCoordinator.value.publishLearnedModelOptions(familyKey, merged);
+        }
+      }
+    });
+    const applyPersistedLearnedModels = Effect.fn("AcpRegistryDriver.applyPersistedLearnedModels")(
+      function* (provider: ServerProvider) {
+        const learned = yield* Ref.get(learnedModelOptions);
+        const models = applyLearnedModelOptionsToModels(provider.models, learned);
+        return models === provider.models ? provider : { ...provider, models };
+      },
+    );
     const applyLiveConfiguration = (
       provider: ServerProvider,
       configuration: AcpRegistryLiveConfiguration,
@@ -849,7 +920,13 @@ export const AcpRegistryDriver: ProviderDriver<
           learned.length > 0 ? learned : provider.models,
         );
         return [next, next.models === provider.models ? learned : next.models];
-      });
+      }).pipe(
+        Effect.flatMap((next) =>
+          recordLearnedOptions(extractLearnedModelOptions(next.models), {
+            preferIncoming: true,
+          }).pipe(Effect.andThen(applyPersistedLearnedModels(next))),
+        ),
+      );
     const clearLearnedModels = Ref.set(learnedModels, []);
     const withLiveRuntimeState = Effect.fn("AcpRegistryDriver.withLiveRuntimeState")(function* (
       input: ServerProvider,
@@ -882,11 +959,12 @@ export const AcpRegistryDriver: ProviderDriver<
               );
             }),
           );
-      if (usageLimitsCache === null) return runtimeApplied;
+      const withPersistedModels = yield* applyPersistedLearnedModels(runtimeApplied);
+      if (usageLimitsCache === null) return withPersistedModels;
       const cachedLimits = yield* Ref.get(usageLimitsCache);
       return cachedLimits.entry === null
-        ? runtimeApplied
-        : applyUsageLimitsState(runtimeApplied, cachedLimits.entry.result);
+        ? withPersistedModels
+        : applyUsageLimitsState(withPersistedModels, cachedLimits.entry.result);
     });
     // A local executable's version comes only from probing it, so readiness checks reuse the last report.
     const reportedLocalVersion = yield* Ref.make<string | null>(null);
@@ -954,18 +1032,23 @@ export const AcpRegistryDriver: ProviderDriver<
         yield* Ref.set(reportedLocalVersion, enriched.version);
       }
       if (enriched.status === "ready") {
+        yield* recordLearnedOptions(extractLearnedModelOptions(enriched.models), {
+          preferIncoming: false,
+        });
+        const mergedEnriched = yield* applyPersistedLearnedModels(enriched);
         const completedAt = yield* Clock.currentTimeMillis;
         yield* Ref.update(enrichmentCache, (current) =>
           current.generation === cacheState.generation
             ? {
                 ...current,
                 entry: {
-                  provider: enriched,
-                  expiresAt: completedAt + acpRegistryProbeTtlMs(enriched),
+                  provider: mergedEnriched,
+                  expiresAt: completedAt + acpRegistryProbeTtlMs(mergedEnriched),
                 },
               }
             : current,
         );
+        return { provider: mergedEnriched, generation: cacheState.generation, refreshed: true };
       }
       return { provider: enriched, generation: cacheState.generation, refreshed: true };
     });
@@ -1135,8 +1218,55 @@ export const AcpRegistryDriver: ProviderDriver<
               ),
             ),
         );
+        const publishSiblingLearnedOptions =
+          familyKey === null
+            ? null
+            : runtimeCoordinator.value.watchLearnedModelOptions(familyKey, (learnedBySlug) =>
+                liveSnapshotSemaphore.withPermit(
+                  recordLearnedOptions(learnedBySlug, {
+                    preferIncoming: true,
+                    broadcast: false,
+                  }).pipe(
+                    Effect.andThen(
+                      Ref.update(enrichmentCache, (cache) => {
+                        if (cache.entry === null) return cache;
+                        const mergedModels = applyLearnedModelOptionsToModels(
+                          cache.entry.provider.models,
+                          learnedBySlug,
+                          { preferLearned: true },
+                        );
+                        if (mergedModels === cache.entry.provider.models) return cache;
+                        return {
+                          ...cache,
+                          entry: {
+                            ...cache.entry,
+                            provider: { ...cache.entry.provider, models: mergedModels },
+                          },
+                        };
+                      }),
+                    ),
+                    Effect.andThen(getSnapshot),
+                    Effect.flatMap((current) => {
+                      const mergedModels = applyLearnedModelOptionsToModels(
+                        current.models,
+                        learnedBySlug,
+                        { preferLearned: true },
+                      );
+                      return mergedModels === current.models
+                        ? Effect.void
+                        : publishSnapshot({ ...current, models: mergedModels });
+                    }),
+                  ),
+                ),
+              );
         return yield* Effect.all(
-          [...foregroundTasks, publishLiveCommands, publishLiveConfiguration, publishUrlAuthAction],
+          [
+            ...foregroundTasks,
+            publishLiveCommands,
+            publishLiveConfiguration,
+            publishUrlAuthAction,
+            ...(publishSiblingLearnedOptions === null ? [] : [publishSiblingLearnedOptions]),
+          ],
           {
             concurrency: "unbounded",
             discard: true,
@@ -1290,6 +1420,55 @@ export const AcpRegistryDriver: ProviderDriver<
               providerId,
             }),
           ).pipe(Effect.tap(() => invalidateAccountCaches)),
+        probeModelOptions: ({ cwd, modelIds }) =>
+          probeAcpRegistryModelOptions({
+            instanceId,
+            settings: effectiveConfig,
+            cwd: cwd ?? host.paths.cwd,
+            environment: processEnvironment,
+            modelIds,
+          }).pipe(
+            Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.provideService(SecureRandom.SecureRandom, random),
+            Effect.tap((result) =>
+              Object.keys(result.learnedBySlug).length === 0
+                ? Effect.void
+                : liveSnapshotSemaphore.withPermit(
+                    recordLearnedOptions(result.learnedBySlug, {
+                      preferIncoming: true,
+                      broadcast: true,
+                    }).pipe(
+                      Effect.andThen(
+                        Ref.update(enrichmentCache, (cache) => {
+                          if (cache.entry === null) return cache;
+                          const mergedModels = applyLearnedModelOptionsToModels(
+                            cache.entry.provider.models,
+                            result.learnedBySlug,
+                            { preferLearned: true },
+                          );
+                          if (mergedModels === cache.entry.provider.models) return cache;
+                          return {
+                            ...cache,
+                            entry: {
+                              ...cache.entry,
+                              provider: { ...cache.entry.provider, models: mergedModels },
+                            },
+                          };
+                        }),
+                      ),
+                      Effect.andThen(snapshot.refresh),
+                      Effect.asVoid,
+                    ),
+                  ),
+            ),
+            Effect.map((result) => ({
+              probedCount: result.probedCount,
+              updatedCount: result.updatedCount,
+            })),
+          ),
         logout: (cwd) => {
           const logout = logoutAcpRegistry({
             instanceId,

@@ -1,4 +1,12 @@
-import { ArrowDownIcon, ArrowUpIcon, PencilIcon, PlusIcon, StarIcon, XIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  StarIcon,
+  XIcon,
+} from "lucide-react";
 import { msg, T, useGT, useMessages } from "gt-react";
 import { memo, useEffect, useRef, useState } from "react";
 import {
@@ -121,6 +129,8 @@ interface ProviderModelsSectionProps {
   readonly onFavoriteModelsChange: (next: ReadonlyArray<string>) => void;
   readonly onToggleFavorite: (model: string) => void;
   readonly onModelOrderChange: (next: ReadonlyArray<string>) => void;
+  readonly onProbeModelOptions?: (modelIds: ReadonlyArray<string>) => Promise<void>;
+  readonly probingModelOptions?: boolean;
 }
 
 export function ProviderModelsSection({
@@ -138,6 +148,8 @@ export function ProviderModelsSection({
   onFavoriteModelsChange,
   onToggleFavorite,
   onModelOrderChange,
+  onProbeModelOptions,
+  probingModelOptions = false,
 }: ProviderModelsSectionProps) {
   const gt = useGT();
   const [input, setInput] = useState("");
@@ -204,6 +216,9 @@ export function ProviderModelsSection({
 
   // Derive after the effect and use hiddenModels directly to preserve the editor's option-array cache.
   const builtInModels = models.filter((model) => !model.isCustom);
+  const enabledBuiltInSlugs = builtInModels
+    .filter((model) => !hiddenModelSet.has(model.slug) || favoriteModelSet.has(model.slug))
+    .map((model) => model.slug);
   const allBuiltInModelsHidden =
     builtInModels.length > 0 && builtInModels.every((model) => hiddenModels.includes(model.slug));
 
@@ -377,6 +392,22 @@ export function ProviderModelsSection({
               }}
             >
               {allBuiltInModelsHidden ? gt("Enable all") : gt("Disable all")}
+            </Button>
+          ) : null}
+          {onProbeModelOptions && enabledBuiltInSlugs.length > 0 ? (
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={probingModelOptions}
+              onClick={() => void onProbeModelOptions(enabledBuiltInSlugs)}
+            >
+              <RefreshCwIcon className={cn("size-3", probingModelOptions && "animate-spin")} />
+              <span>
+                {probingModelOptions
+                  ? gt("拉取中…")
+                  : gt("拉取思考等级 ({count})", { count: enabledBuiltInSlugs.length })}
+              </span>
             </Button>
           ) : null}
           <span className="text-xs text-muted-foreground">

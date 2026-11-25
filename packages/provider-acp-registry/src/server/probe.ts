@@ -8,6 +8,7 @@ import {
   type AcpRegistryProbeModel,
   type AcpRegistryUrlAuthAction,
   type ProviderInstanceId,
+  type ProviderOptionDescriptor,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
@@ -640,6 +641,248 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       slashCommands: result.commands.slashCommands,
       skills: result.commands.skills,
     };
+  },
+);
+
+const MODEL_OPTION_PROBE_SETTLE_DELAY = Duration.millis(350);
+const MAX_PROBED_MODELS_PER_CALL = 32;
+
+export interface AcpRegistryProbeModelOptionsResult {
+  readonly probedCount: number;
+  readonly updatedCount: number;
+  readonly learnedBySlug: Readonly<Record<string, ReadonlyArray<ProviderOptionDescriptor>>>;
+}
+
+export const probeAcpRegistryModelOptions = Effect.fn("AcpRegistryProbe.probeModelOptions")(
+  function* (
+    input: AcpRegistryConfigurationProbeInput & {
+      readonly modelIds: ReadonlyArray<string>;
+    },
+  ): Effect.fn.Return<
+    AcpRegistryProbeModelOptionsResult,
+    AcpRegistryOperationError,
+    | AcpRegistrySupport.AcpRegistryCatalog
+    | ChildProcessSpawner.ChildProcessSpawner
+    | FileSystem.FileSystem
+    | Path.Path
+    | SecureRandom.SecureRandom
+  > {
+    const uniqueModelIds = [
+      ...new Set(input.modelIds.map((id) => id.trim()).filter(Boolean)),
+    ].slice(0, MAX_PROBED_MODELS_PER_CALL);
+    if (uniqueModelIds.length === 0) {
+      return { probedCount: 0, updatedCount: 0, learnedBySlug: {} };
+    }
+    const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+    const probeTimeoutMs = Math.max(
+      resolveProviderProbeTimeoutMs("acp_registry", PROBE_TIMEOUT_MS, input.environment),
+      45_000,
+    );
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const random = yield* SecureRandom.SecureRandom;
+    const pty = yield* Effect.serviceOption(PtyAdapter.PtyAdapter);
+
+    return yield* Effect.gen(function* () {
+      const resolved = yield* catalog
+        .resolve(input.settings, input.cwd, input.environment)
+        .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError));
+      const spawn = yield* isolateDeepSeekProbeHistory(
+        input.settings.commandPath,
+        resolved.spawn,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AcpRegistryOperationError({
+              reason: "probe_failed",
+              message: "Could not prepare temporary history for the DeepSeek Harness probe.",
+              cause,
+            }),
+        ),
+      );
+      const authMethodsRef = yield* Ref.make<ReadonlyArray<AcpRegistryProbeAuthMethod>>([]);
+      const authActionRef = yield* Ref.make<AcpRegistryUrlAuthAction | undefined>(undefined);
+      const runtimeContext = yield* Layer.build(
+        AcpSessionRuntime.layer({
+          spawn,
+          cwd: input.cwd,
+          clientCapabilities: {
+            auth: { terminal: Option.isSome(pty) },
+            elicitation: { url: {} },
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: "t3-code-provider-model-options-probe", version: "0.0.0" },
+          authenticateOnAuthRequired: false,
+          onInitialized: (initializeResult) =>
+            Ref.set(
+              authMethodsRef,
+              normalizeAcpRegistryAuthMethods(initializeResult.authMethods, {
+                command: resolved.spawn.command,
+                args: resolved.spawn.args,
+              }),
+            ),
+          ...(input.settings.authMethodId ? { authMethodId: input.settings.authMethodId } : {}),
+        }).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+              Layer.succeed(SecureRandom.SecureRandom, random),
+            ),
+          ),
+        ),
+      );
+      const runtime = yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
+        Effect.provide(runtimeContext),
+      );
+      const configOptionsRef = yield* Ref.make<
+        ReadonlyArray<EffectAcpSchema.SessionConfigOption> | undefined
+      >(undefined);
+      const configUpdateSignalRef = yield* Ref.make<Deferred.Deferred<void> | null>(null);
+      const modelsAdvertised = yield* Deferred.make<void>();
+
+      yield* runtime.handleSessionUpdate((notification) => {
+        const update = notification.update;
+        if (update.sessionUpdate === "config_option_update") {
+          const hasAdvertisedModels = acpRegistryAdvertisesModelCatalog(update.configOptions);
+          return Ref.set(configOptionsRef, update.configOptions).pipe(
+            Effect.andThen(
+              Ref.get(configUpdateSignalRef).pipe(
+                Effect.flatMap((signal) =>
+                  signal ? Deferred.succeed(signal, undefined).pipe(Effect.asVoid) : Effect.void,
+                ),
+              ),
+            ),
+            Effect.andThen(
+              hasAdvertisedModels
+                ? Deferred.succeed(modelsAdvertised, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            ),
+          );
+        }
+        return Effect.void;
+      });
+
+      const startResult = yield* Effect.result(runtime.start());
+      if (Result.isFailure(startResult)) {
+        return yield* acpRegistryProbeFailure(
+          startResult.failure,
+          yield* Ref.get(authMethodsRef),
+          yield* Ref.get(authActionRef),
+        );
+      }
+      const started = startResult.success;
+      yield* Effect.addFinalizer(() =>
+        runtime
+          .deleteSession(started.sessionId)
+          .pipe(Effect.timeoutOption(PROBE_SESSION_DELETE_TIMEOUT), Effect.ignore),
+      );
+
+      const hasInitialModels = acpRegistryAdvertisesModelCatalog(
+        started.sessionSetupResult.configOptions,
+        started.sessionSetupResult.models,
+      );
+      if (!hasInitialModels) {
+        yield* Deferred.await(modelsAdvertised).pipe(
+          Effect.timeoutOption(MODEL_ADVERTISEMENT_GRACE),
+        );
+      }
+
+      const initialConfigOptions =
+        (yield* Ref.get(configOptionsRef)) ?? (yield* runtime.getConfigOptions);
+      const initialLive = normalizeAcpRegistryLiveConfiguration(
+        initialConfigOptions,
+        (yield* runtime.getModeState) ?? parseSessionModeState(started.sessionSetupResult),
+        started.sessionSetupResult.models,
+      );
+      const modelConfigOptionId = started.modelConfigId;
+      const learnedBySlug: Record<string, ReadonlyArray<ProviderOptionDescriptor>> = {};
+      let currentModelId = initialLive.currentModelId;
+      let probedCount = 0;
+
+      for (const modelId of uniqueModelIds) {
+        probedCount += 1;
+        if (modelId === currentModelId) {
+          const currentConfigOptions =
+            (yield* Ref.get(configOptionsRef)) ?? (yield* runtime.getConfigOptions);
+          const normalized = normalizeAcpRegistryLiveConfiguration(
+            currentConfigOptions,
+            (yield* runtime.getModeState) ?? parseSessionModeState(started.sessionSetupResult),
+            started.sessionSetupResult.models,
+          );
+          if (normalized.configOptions.length > 0) {
+            learnedBySlug[modelId] = normalized.configOptions;
+          }
+          continue;
+        }
+
+        const updateSignal = yield* Deferred.make<void>();
+        yield* Ref.set(configUpdateSignalRef, updateSignal);
+
+        let updatedConfigOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | undefined;
+        if (modelConfigOptionId !== null && modelConfigOptionId !== undefined) {
+          const setResult = yield* Effect.result(
+            runtime.setConfigOption(modelConfigOptionId, modelId, {
+              allowUnlistedValue: true,
+              resendCurrentValue: true,
+            }),
+          );
+          if (Result.isSuccess(setResult)) {
+            currentModelId = modelId;
+            if (setResult.success.configOptions != null) {
+              updatedConfigOptions = setResult.success.configOptions;
+            }
+          }
+        }
+        if (updatedConfigOptions === undefined && currentModelId !== modelId) {
+          const setModelResult = yield* Effect.result(runtime.setSessionModel(modelId));
+          if (Result.isSuccess(setModelResult)) {
+            currentModelId = modelId;
+            yield* Deferred.await(updateSignal).pipe(
+              Effect.timeoutOption(MODEL_OPTION_PROBE_SETTLE_DELAY),
+            );
+            updatedConfigOptions =
+              (yield* Ref.get(configOptionsRef)) ?? (yield* runtime.getConfigOptions);
+          }
+        }
+        yield* Ref.set(configUpdateSignalRef, null);
+
+        if (currentModelId === modelId) {
+          const effectiveOptions =
+            updatedConfigOptions ??
+            (yield* Ref.get(configOptionsRef)) ??
+            (yield* runtime.getConfigOptions);
+          const normalized = normalizeAcpRegistryLiveConfiguration(
+            effectiveOptions,
+            (yield* runtime.getModeState) ?? parseSessionModeState(started.sessionSetupResult),
+            started.sessionSetupResult.models,
+          );
+          if (normalized.configOptions.length > 0) {
+            learnedBySlug[modelId] = normalized.configOptions;
+          }
+        }
+      }
+
+      return {
+        probedCount,
+        updatedCount: Object.keys(learnedBySlug).length,
+        learnedBySlug,
+      } satisfies AcpRegistryProbeModelOptionsResult;
+    }).pipe(
+      Effect.scoped,
+      Effect.timeoutOrElse({
+        duration: probeTimeoutMs,
+        orElse: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "probe_failed",
+              message: `Probing model options timed out after ${probeTimeoutMs / 1_000} seconds.`,
+            }),
+          ),
+      }),
+      Effect.mapError((error) =>
+        error._tag === "AcpRegistryOperationError" ? error : acpRegistryProbeFailure(error),
+      ),
+    );
   },
 );
 

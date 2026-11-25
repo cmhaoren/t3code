@@ -1790,6 +1790,14 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => `${environmentId}:${input.agentId}`,
       },
     }),
+    probeAcpModelOptions: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:acp-registry:probe-model-options",
+      tag: WS_METHODS.serverProbeAcpModelOptions,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => `${environmentId}:${input.instanceId}`,
+      },
+    }),
     uninstallAcpRegistryManagedBinary: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:acp-registry:uninstall-managed-binary",
       tag: WS_METHODS.serverUninstallAcpRegistryManagedBinary,

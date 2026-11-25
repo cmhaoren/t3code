@@ -4,6 +4,7 @@ import type {
   AcpRegistryListSessionsResult,
   AcpRegistryListProvidersResult,
   AcpRegistryOperationError,
+  AcpRegistryProbeModelOptionsResult,
   AcpRegistrySetProviderInput,
   ProviderDriverKind,
   ResolvedProviderInstanceEnvironment,
@@ -86,6 +87,10 @@ export interface ProviderInstance {
       readonly cwd: string;
       readonly providerId: string;
     }) => Effect.Effect<void, AcpRegistryOperationError>;
+    readonly probeModelOptions?: (input: {
+      readonly cwd?: string;
+      readonly modelIds: ReadonlyArray<string>;
+    }) => Effect.Effect<AcpRegistryProbeModelOptionsResult, AcpRegistryOperationError>;
   };
 }
 

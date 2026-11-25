@@ -16,6 +16,15 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import type { AcpRegistryAvailableCommands, AcpRegistryLiveConfiguration } from "./probe.ts";
+import {
+  mergeLearnedModelOptionsMaps,
+  type LearnedModelOptionsBySlug,
+} from "./modelOptionsStore.ts";
+
+interface LearnedModelOptionsUpdate {
+  readonly familyKey: string;
+  readonly learnedBySlug: LearnedModelOptionsBySlug;
+}
 
 interface AvailableCommandsUpdate {
   readonly instanceId: ProviderInstanceId;
@@ -78,6 +87,17 @@ export class AcpRegistryRuntimeCoordinator extends Context.Service<
       instanceId: ProviderInstanceId,
       onUpdate: (configuration: AcpRegistryLiveConfiguration) => Effect.Effect<void>,
     ) => Effect.Effect<void>;
+    readonly publishLearnedModelOptions: (
+      familyKey: string,
+      learnedBySlug: LearnedModelOptionsBySlug,
+    ) => Effect.Effect<void>;
+    readonly getLearnedModelOptions: (
+      familyKey: string,
+    ) => Effect.Effect<LearnedModelOptionsBySlug>;
+    readonly watchLearnedModelOptions: (
+      familyKey: string,
+      onUpdate: (learnedBySlug: LearnedModelOptionsBySlug) => Effect.Effect<void>,
+    ) => Effect.Effect<void>;
     readonly requestUrlAuthentication: (
       instanceId: ProviderInstanceId,
       action: AcpRegistryUrlAuthAction,
@@ -106,6 +126,8 @@ const make = Effect.gen(function* () {
   const liveConfigurationByInstance = yield* Ref.make(
     new Map<ProviderInstanceId, AcpRegistryLiveConfiguration>(),
   );
+  const learnedModelOptionsUpdates = yield* PubSub.unbounded<LearnedModelOptionsUpdate>();
+  const learnedModelOptionsByFamily = yield* Ref.make(new Map<string, LearnedModelOptionsBySlug>());
   const urlAuthActionUpdates = yield* PubSub.unbounded<UrlAuthActionUpdate>();
   const pendingUrlAuthActions = yield* Ref.make(
     new Map<ProviderInstanceId, PendingUrlAuthAction>(),
@@ -335,6 +357,52 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const getLearnedModelOptions: AcpRegistryRuntimeCoordinator["Service"]["getLearnedModelOptions"] =
+    Effect.fn("AcpRegistryRuntimeCoordinator.getLearnedModelOptions")(function* (familyKey) {
+      return (yield* Ref.get(learnedModelOptionsByFamily)).get(familyKey) ?? {};
+    });
+
+  const publishLearnedModelOptions: AcpRegistryRuntimeCoordinator["Service"]["publishLearnedModelOptions"] =
+    (familyKey, learnedBySlug) =>
+      Object.keys(learnedBySlug).length === 0
+        ? Effect.void
+        : Ref.modify(learnedModelOptionsByFamily, (current) => {
+            const existing = current.get(familyKey) ?? {};
+            const merged = mergeLearnedModelOptionsMaps(existing, learnedBySlug, {
+              preferIncoming: true,
+            });
+            const changed = JSON.stringify(merged) !== JSON.stringify(existing);
+            return [
+              changed ? merged : null,
+              changed ? new Map(current).set(familyKey, merged) : current,
+            ] as const;
+          }).pipe(
+            Effect.flatMap((merged) =>
+              merged === null
+                ? Effect.void
+                : PubSub.publish(learnedModelOptionsUpdates, {
+                    familyKey,
+                    learnedBySlug: merged,
+                  }).pipe(Effect.asVoid),
+            ),
+          );
+
+  const watchLearnedModelOptions: AcpRegistryRuntimeCoordinator["Service"]["watchLearnedModelOptions"] =
+    (familyKey, onUpdate) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const subscription = yield* PubSub.subscribe(learnedModelOptionsUpdates);
+          const current = yield* getLearnedModelOptions(familyKey);
+          if (Object.keys(current).length > 0) {
+            yield* onUpdate(current);
+          }
+          yield* Stream.fromSubscription(subscription).pipe(
+            Stream.filter((update) => update.familyKey === familyKey),
+            Stream.runForEach((update) => onUpdate(update.learnedBySlug)),
+          );
+        }),
+      );
+
   return AcpRegistryRuntimeCoordinator.of({
     withForegroundStartup,
     runBackgroundProbe,
@@ -347,6 +415,9 @@ const make = Effect.gen(function* () {
     publishLiveConfiguration,
     getLiveConfiguration,
     watchLiveConfiguration,
+    publishLearnedModelOptions,
+    getLearnedModelOptions,
+    watchLearnedModelOptions,
     requestUrlAuthentication,
     acceptUrlAuthentication,
     getUrlAuthAction,

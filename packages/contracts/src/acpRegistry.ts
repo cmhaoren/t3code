@@ -1,7 +1,13 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { ProjectId, ThreadId, TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
+import {
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+  TrimmedString,
+} from "./baseSchemas.ts";
 import { ProviderOptionDescriptor } from "./model.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -336,6 +342,19 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
   "unsupported_platform",
 ]);
 export type AcpRegistryOperationErrorReason = typeof AcpRegistryOperationErrorReason.Type;
+
+export const AcpRegistryProbeModelOptionsInput = Schema.Struct({
+  instanceId: ProviderInstanceId,
+  modelIds: Schema.Array(TrimmedNonEmptyString).check(Schema.isMaxLength(32)),
+  projectId: Schema.optional(ProjectId),
+});
+export type AcpRegistryProbeModelOptionsInput = typeof AcpRegistryProbeModelOptionsInput.Type;
+
+export const AcpRegistryProbeModelOptionsResult = Schema.Struct({
+  probedCount: NonNegativeInt,
+  updatedCount: NonNegativeInt,
+});
+export type AcpRegistryProbeModelOptionsResult = typeof AcpRegistryProbeModelOptionsResult.Type;
 
 export class AcpRegistryOperationError extends Schema.TaggedError<AcpRegistryOperationError>()(
   "AcpRegistryOperationError",

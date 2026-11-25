@@ -50,6 +50,8 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Switch } from "../ui/switch";
 import { ManagedControl, ManagedNotice } from "../ManagedPolicy";
 import { managedInstanceLocks, useManagedPolicy } from "../../state/managedPolicy";
+import { serverEnvironment } from "../../state/server";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { disallowedProviderMessage, isManagedDriverAllowed } from "@t3tools/contracts";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -814,6 +816,41 @@ export function ProviderInstanceCard({
 }: ProviderInstanceCardProps) {
   const gt = useGT();
   const m = useMessages();
+  const probeAcpModelOptions = useAtomCommand(serverEnvironment.probeAcpModelOptions, {
+    label: "probe ACP model options",
+    reportFailure: false,
+  });
+  const [probingModelOptions, setProbingModelOptions] = useState(false);
+  const handleProbeModelOptions = useStableCallback(async (modelIds: ReadonlyArray<string>) => {
+    if (environmentId === undefined || modelIds.length === 0 || probingModelOptions) return;
+    setProbingModelOptions(true);
+    try {
+      const result = await probeAcpModelOptions({
+        environmentId,
+        input: {
+          instanceId,
+          modelIds,
+          ...(acpProjects[0] ? { projectId: acpProjects[0].id } : {}),
+        },
+      });
+      if (result._tag === "Success") {
+        toastManager.add({
+          type: "success",
+          title: gt("已拉取 {updated} / {probed} 个模型的思考等级并同步同类型实例", {
+            updated: result.value.updatedCount,
+            probed: result.value.probedCount,
+          }),
+        });
+      } else {
+        toastManager.add({
+          type: "error",
+          title: gt("拉取模型思考等级失败"),
+        });
+      }
+    } finally {
+      setProbingModelOptions(false);
+    }
+  });
   const enabled = projectOverride?.effectiveEnabled ?? resolveProviderInstanceEnabled(instance);
   const effectiveProvider = liveProvider && { ...liveProvider, enabled };
   const compatibility = enabled ? liveProvider?.compatibilityAdvisory : undefined;
@@ -1524,6 +1561,15 @@ export function ProviderInstanceCard({
               onFavoriteModelsChange={onFavoriteModelsChange}
               onToggleFavorite={onToggleFavorite}
               onModelOrderChange={onModelOrderChange}
+              {...(environmentId !== undefined &&
+              liveProvider?.driver === "acpRegistry" &&
+              liveProvider.installed &&
+              enabled
+                ? {
+                    onProbeModelOptions: handleProbeModelOptions,
+                    probingModelOptions,
+                  }
+                : {})}
             />
           </div>
         </SettingsSection>
