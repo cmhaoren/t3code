@@ -3,6 +3,7 @@ import { ProviderInstanceId, type TeamOrchestrationConfig } from "@t3tools/contr
 import {
   applyCommanderModeDefaults,
   buildTeamOrchestrationRetroPrompt,
+  collectTeamOrchestrationModelSelections,
   compileSubagentNormCardPrefix,
   compileTeamOrchestrationDeactivatedNotice,
   compileTeamOrchestrationInstructions,
@@ -10,6 +11,7 @@ import {
   createDefaultTeamNormCards,
   createDefaultTeamOrchestrationConfig,
   getBuiltInTeamOrchestrationPresets,
+  inferTeamOrchestrationStageFromRole,
   summarizeTeamOrchestrationBadge,
 } from "./teamOrchestration.ts";
 
@@ -168,5 +170,48 @@ describe("teamOrchestration", () => {
     });
     expect(retro).toContain("review.blast-radius");
     expect(retro).toContain("C:/Users/demo/.t3/userdata/orchestration/cards");
+  });
+
+  it("properly JSON-escapes composite model ids, includes anti-compaction note, infers stage from role, and collects pinned models", () => {
+    const dsh = ProviderInstanceId.make("dsh");
+    const agy = ProviderInstanceId.make("antigravity");
+    const config: TeamOrchestrationConfig = {
+      ...createDefaultTeamOrchestrationConfig(),
+      enabled: true,
+      implementer: {
+        mode: "subagent",
+        isolation: "auto",
+        routineModel: {
+          instanceId: dsh,
+          model: '["apigoto-1","deepseek-flash"]',
+          options: [{ id: "reasoning_effort", value: "high" }],
+        },
+        standardModel: null,
+        complexModel: {
+          instanceId: agy,
+          model: "gemini-4-neon",
+          options: [{ id: "thought_level", value: "high" }],
+        },
+      },
+    };
+
+    const compiled = compileTeamOrchestrationInstructions({ config });
+    expect(compiled).toContain('model: "[\\"apigoto-1\\",\\"deepseek-flash\\"]"');
+    expect(compiled).toContain("orchestrator_capabilities");
+    expect(compiled).toContain("抗压缩保留");
+
+    expect(inferTeamOrchestrationStageFromRole("implementation")).toBe("implement");
+    expect(inferTeamOrchestrationStageFromRole("test")).toBe("implement");
+    expect(inferTeamOrchestrationStageFromRole("review")).toBe("review");
+    expect(inferTeamOrchestrationStageFromRole("design")).toBe("plan");
+    expect(inferTeamOrchestrationStageFromRole("research")).toBeUndefined();
+    expect(inferTeamOrchestrationStageFromRole(undefined)).toBeUndefined();
+
+    const pinned = collectTeamOrchestrationModelSelections(config);
+    expect(pinned.map((item) => `${item.instanceId}:${item.model}`)).toEqual([
+      'dsh:["apigoto-1","deepseek-flash"]',
+      "antigravity:gemini-4-neon",
+    ]);
+    expect(collectTeamOrchestrationModelSelections({ ...config, enabled: false })).toEqual([]);
   });
 });

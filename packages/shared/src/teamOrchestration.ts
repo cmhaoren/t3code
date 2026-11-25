@@ -508,15 +508,57 @@ function formatModelSelectionForPrompt(
   const providerLabel = providerLabelByInstanceId?.get(selection.instanceId);
   const instancePart =
     providerLabel && providerLabel !== selection.instanceId
-      ? `${providerLabel} (providerInstanceId: "${selection.instanceId}")`
-      : `providerInstanceId: "${selection.instanceId}"`;
+      ? `${providerLabel} (providerInstanceId: ${JSON.stringify(selection.instanceId)})`
+      : `providerInstanceId: ${JSON.stringify(selection.instanceId)}`;
   const optionsPart =
     selection.options && selection.options.length > 0
       ? `, options: ${JSON.stringify(
           Object.fromEntries(selection.options.map((opt) => [opt.id, opt.value])),
         )}`
       : "";
-  return `${instancePart}, model: "${selection.model}"${optionsPart}`;
+  return `${instancePart}, model: ${JSON.stringify(selection.model)}${optionsPart}`;
+}
+
+export function inferTeamOrchestrationStageFromRole(
+  role: string | null | undefined,
+): TeamOrchestrationStage | undefined {
+  switch (role) {
+    case "implementation":
+    case "test":
+      return "implement";
+    case "review":
+      return "review";
+    case "design":
+      return "plan";
+    default:
+      return undefined;
+  }
+}
+
+export function collectTeamOrchestrationModelSelections(
+  config: TeamOrchestrationConfig | null | undefined,
+): ReadonlyArray<ModelSelection> {
+  if (!config || !config.enabled) {
+    return [];
+  }
+  const selections: Array<ModelSelection> = [];
+  const push = (selection: ModelSelection | null | undefined) => {
+    if (selection) {
+      selections.push(selection);
+    }
+  };
+  push(config.planner.modelSelection);
+  for (const selection of config.planner.panelModels) {
+    push(selection);
+  }
+  push(config.implementer.routineModel);
+  push(config.implementer.standardModel);
+  push(config.implementer.complexModel);
+  push(config.reviewer.defaultModel);
+  for (const selection of Object.values(config.reviewer.angleModelOverrides)) {
+    push(selection);
+  }
+  return selections;
 }
 
 function getCardBody(cardId: TeamNormCardId, cardMap: ReadonlyMap<TeamNormCardId, string>): string {
@@ -585,6 +627,7 @@ export function compileTeamOrchestrationInstructions(
   const sections: Array<string> = [
     "<t3_code_team_orchestration>",
     "本会话已开启团队编排配置。你（主会话）担任【指挥官】，请严格按以下阶段顺序、模型绑定与规范卡片推进；需要委派子代理时使用 `delegate_task` 并传入对应的 `target`、`isolation`、`orchestrationStage`（及 `reviewAngle`）。",
+    "【抗压缩保留】若会话中途触发上下文压缩/摘要，必须在摘要中完整保留本段团队编排的阶段模式、各档位模型绑定（`providerInstanceId`/`model`/`options`）与工程底线；如在长任务中遗忘或不确定配置，随时调用 `orchestrator_capabilities` 即可从返回值的 `teamOrchestration` 字段重新读取完整编排指令。",
   ];
 
   // Stage 1: Commander

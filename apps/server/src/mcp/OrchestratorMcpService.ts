@@ -121,7 +121,12 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { compileSubagentNormCardPrefix } from "@t3tools/shared/teamOrchestration";
+import {
+  collectTeamOrchestrationModelSelections,
+  compileSubagentNormCardPrefix,
+  compileTeamOrchestrationInstructions,
+  inferTeamOrchestrationStageFromRole,
+} from "@t3tools/shared/teamOrchestration";
 import { loadEffectiveTeamNormCardsOptional } from "../orchestration-v2/teamNormCardStore.ts";
 import {
   clientModeCeiling,
@@ -2748,6 +2753,42 @@ const make = Effect.gen(function* () {
         Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
       );
       const inherited = parent?.thread.modelSelection;
+      const activeTeamOrchestration =
+        parent !== undefined &&
+        parent.thread.lineage.parentThreadId === null &&
+        parent.thread.teamOrchestration?.enabled === true
+          ? parent.thread.teamOrchestration
+          : null;
+      const pinnedTeamModels = collectTeamOrchestrationModelSelections(activeTeamOrchestration);
+      let activeTeamOrchestrationResult:
+        | {
+            readonly config: NonNullable<typeof activeTeamOrchestration>;
+            readonly instructions: string;
+          }
+        | undefined = undefined;
+      if (activeTeamOrchestration !== null) {
+        const cards = yield* loadEffectiveTeamNormCardsOptional({
+          projectWorkspaceRoot: cwd ?? null,
+        });
+        const providerLabelByInstanceId = new Map<string, string>();
+        for (const provider of providers) {
+          const label = provider.displayName?.trim();
+          if (label && label.length > 0) {
+            providerLabelByInstanceId.set(provider.instanceId, label);
+          }
+        }
+        const compiled = compileTeamOrchestrationInstructions({
+          config: activeTeamOrchestration,
+          cards,
+          providerLabelByInstanceId,
+        });
+        if (compiled !== null) {
+          activeTeamOrchestrationResult = {
+            config: activeTeamOrchestration,
+            instructions: compiled,
+          };
+        }
+      }
       const searchTerms = input.search?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
       return {
         parentThreadId: parent?.thread.id ?? null,
@@ -2783,6 +2824,10 @@ const make = Effect.gen(function* () {
             isPinned: (model) =>
               model.isCustom ||
               (inherited?.instanceId === provider.instanceId && inherited.model === model.slug) ||
+              pinnedTeamModels.some(
+                (selection) =>
+                  selection.instanceId === provider.instanceId && selection.model === model.slug,
+              ) ||
               (settings.favorites ?? []).some(
                 (favorite) =>
                   favorite.provider === provider.instanceId && favorite.model === model.slug,
@@ -2822,6 +2867,9 @@ const make = Effect.gen(function* () {
           scheduledTasks: true,
           maxBatchThreads: 20,
         },
+        ...(activeTeamOrchestrationResult === undefined
+          ? {}
+          : { teamOrchestration: activeTeamOrchestrationResult }),
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
@@ -2920,7 +2968,14 @@ const make = Effect.gen(function* () {
       }
       const parentNodeId = parentRun.rootNodeId;
       let resolvedTaskPrompt = taskPrompt(input);
-      if (input.orchestrationStage !== undefined || input.reviewAngle !== undefined) {
+      const effectiveStage =
+        input.orchestrationStage ??
+        (input.reviewAngle !== undefined
+          ? "review"
+          : parent.thread.teamOrchestration?.enabled === true
+            ? inferTeamOrchestrationStageFromRole(input.role)
+            : undefined);
+      if (effectiveStage !== undefined || input.reviewAngle !== undefined) {
         const parentProject = yield* projects
           .getById(parent.thread.projectId)
           .pipe(Effect.orElseSucceed(() => Option.none()));
@@ -2928,7 +2983,7 @@ const make = Effect.gen(function* () {
           projectWorkspaceRoot: Option.getOrUndefined(parentProject)?.workspaceRoot ?? null,
         });
         const normPrefix = compileSubagentNormCardPrefix({
-          ...(input.orchestrationStage === undefined ? {} : { stage: input.orchestrationStage }),
+          ...(effectiveStage === undefined ? {} : { stage: effectiveStage }),
           ...(input.reviewAngle === undefined ? {} : { reviewAngle: input.reviewAngle }),
           config: parent.thread.teamOrchestration ?? null,
           cards,

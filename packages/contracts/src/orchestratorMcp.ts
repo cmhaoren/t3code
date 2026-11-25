@@ -43,7 +43,11 @@ import {
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
-import { TeamOrchestrationStage, TeamReviewAngleId } from "./teamOrchestration.ts";
+import {
+  TeamOrchestrationConfig,
+  TeamOrchestrationStage,
+  TeamReviewAngleId,
+} from "./teamOrchestration.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000));
@@ -731,6 +735,15 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
     scheduledTasks: Schema.Boolean,
     maxBatchThreads: Schema.Number,
   }),
+  teamOrchestration: Schema.optional(
+    Schema.Struct({
+      config: TeamOrchestrationConfig,
+      instructions: Schema.String,
+    }).annotate({
+      description:
+        "Active team orchestration configuration and compiled commander instructions for this thread, when enabled. Re-read here if context compaction ever dropped earlier instructions.",
+    }),
+  ),
 });
 export type OrchestratorMcpCapabilitiesResult = typeof OrchestratorMcpCapabilitiesResult.Type;
 

@@ -301,7 +301,15 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
-    const deliveredTeamOrchestrationByProviderThread = new Map<string, string | null>();
+    const deliveredTeamOrchestrationByProviderThread = new Map<
+      string,
+      {
+        readonly fingerprint: string | null;
+        readonly observedContextTokens: number | null;
+        readonly observedCompactionCount: number;
+        readonly deliveredAtItemCount: number;
+      }
+    >();
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
     const makeRunControls = (input: {
@@ -2084,6 +2092,23 @@ export const layer: Layer.Layer<
               : sideChatHandoff.summaryText;
           let teamOrchestrationContext = "";
           let pendingTeamOrchestrationFingerprint: string | null | undefined = undefined;
+          const providerThreadTurnItems = projection.turnItems.filter(
+            (item) => item.providerThreadId === runningProviderThread.id,
+          );
+          const observedCompactionCount = providerThreadTurnItems.filter(
+            (item) => item.type === "compaction",
+          ).length;
+          const providerThreadItemCount = providerThreadTurnItems.length;
+          const latestMeasuredUsage = latestNativeContextUsage(projection, runningProviderThread);
+          const currentContextTokens =
+            latestMeasuredUsage?.usage.lastUsedTokens ??
+            latestMeasuredUsage?.usage.usedTokens ??
+            runningProviderThread.contextUsage?.lastUsedTokens ??
+            runningProviderThread.contextUsage?.usedTokens ??
+            null;
+          const previousDelivery = deliveredTeamOrchestrationByProviderThread.get(
+            runningProviderThread.id,
+          );
           if (
             projection.thread.lineage.parentThreadId === null &&
             !compact &&
@@ -2091,9 +2116,17 @@ export const layer: Layer.Layer<
             !isProviderCommand(providerMessage) &&
             !noteContinuation
           ) {
-            const previousFingerprint = deliveredTeamOrchestrationByProviderThread.get(
-              runningProviderThread.id,
-            );
+            const compactedSinceDelivery =
+              previousDelivery !== undefined &&
+              (observedCompactionCount > previousDelivery.observedCompactionCount ||
+                (previousDelivery.observedContextTokens !== null &&
+                  currentContextTokens !== null &&
+                  previousDelivery.observedContextTokens >= 20_000 &&
+                  currentContextTokens < previousDelivery.observedContextTokens * 0.65) ||
+                providerThreadItemCount - previousDelivery.deliveredAtItemCount >= 80);
+            const previousFingerprint = compactedSinceDelivery
+              ? undefined
+              : previousDelivery?.fingerprint;
             const teamConfig = projection.thread.teamOrchestration;
             if (teamConfig?.enabled) {
               const projectWorkspaceRoot = yield* projects
@@ -2114,7 +2147,13 @@ export const layer: Layer.Layer<
                   for (const [instanceId, instanceConfig] of Object.entries(
                     settings.providerInstances,
                   )) {
-                    const candidate = (instanceConfig as { readonly name?: unknown }).name;
+                    const candidate =
+                      (
+                        instanceConfig as {
+                          readonly displayName?: unknown;
+                          readonly name?: unknown;
+                        }
+                      ).displayName ?? (instanceConfig as { readonly name?: unknown }).name;
                     if (typeof candidate === "string" && candidate.trim().length > 0) {
                       labels.set(instanceId, candidate.trim());
                     }
@@ -2198,10 +2237,26 @@ export const layer: Layer.Layer<
             ),
           );
           if (pendingTeamOrchestrationFingerprint !== undefined) {
-            deliveredTeamOrchestrationByProviderThread.set(
-              runningProviderThread.id,
-              pendingTeamOrchestrationFingerprint,
-            );
+            deliveredTeamOrchestrationByProviderThread.set(runningProviderThread.id, {
+              fingerprint: pendingTeamOrchestrationFingerprint,
+              observedContextTokens: currentContextTokens,
+              observedCompactionCount,
+              deliveredAtItemCount: providerThreadItemCount,
+            });
+          } else if (previousDelivery !== undefined) {
+            deliveredTeamOrchestrationByProviderThread.set(runningProviderThread.id, {
+              ...previousDelivery,
+              observedContextTokens:
+                currentContextTokens === null
+                  ? previousDelivery.observedContextTokens
+                  : previousDelivery.observedContextTokens === null
+                    ? currentContextTokens
+                    : Math.max(previousDelivery.observedContextTokens, currentContextTokens),
+              observedCompactionCount: Math.max(
+                previousDelivery.observedCompactionCount,
+                observedCompactionCount,
+              ),
+            });
           }
           // Serialize acceptance writes against dropped-terminal restoration so neither overwrites the other.
           yield* inlineDeliveryLock.withPermits(1)(
