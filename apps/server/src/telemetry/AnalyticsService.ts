@@ -1,5 +1,6 @@
 // T3 ingest retains events and forwards to PostHog; UUIDs deduplicate retries there.
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { isDoNotTrackSet } from "@t3tools/shared/otelEnvironment";
 import type { ClientOs } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
@@ -71,7 +72,7 @@ const TelemetryEnvConfig = Config.all({
   posthogHost: Config.String("T3CODE_POSTHOG_HOST").pipe(
     Config.withDefault("https://ingest.t3.codes"),
   ),
-  enabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.withDefault(true)),
+  enabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.option),
   flushBatchSize: Config.Number("T3CODE_TELEMETRY_FLUSH_BATCH_SIZE").pipe(Config.withDefault(20)),
   maxBufferedEvents: Config.Number("T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS").pipe(
     Config.withDefault(1_000),
@@ -125,15 +126,20 @@ export const make = Effect.gen(function* () {
   // A managed policy can switch analytics off over the environment, never on.
   const policyAllows =
     ManagedPolicy.deniedBy(yield* ManagedPolicy.ManagedPolicy, "telemetry") === undefined;
+  // Product telemetry is strictly opt-in (defaults to false unless explicitly enabled).
+  const explicitlyDisabledAtStartup =
+    Option.isSome(telemetryConfig.enabled) && !telemetryConfig.enabled.value;
+  const enabledAtStartup = Option.getOrElse(telemetryConfig.enabled, () => false);
   // A cached PATH does not establish consent from the current login shell.
   const telemetryEnabled = Effect.suspend(() => {
-    if (!telemetryConfig.enabled || !policyAllows) return Effect.succeed(false);
-    if (!awaitingShellConsent) return Effect.succeed(true);
+    if (explicitlyDisabledAtStartup || !policyAllows || isDoNotTrackSet(hostEnvironment))
+      return Effect.succeed(false);
+    if (!awaitingShellConsent) return Effect.succeed(enabledAtStartup);
     if (hostEnvironment.T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING === "1")
       return Effect.succeed(false);
     const preference = hostEnvironment.T3CODE_TELEMETRY_ENABLED;
     return Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(
-      Config.withDefault(true),
+      Config.withDefault(false),
       Effect.provideService(
         ConfigProvider.ConfigProvider,
         ConfigProvider.fromEnv({
@@ -329,8 +335,9 @@ export const make = Effect.gen(function* () {
 
   const recordOwners: AnalyticsService["Service"]["recordOwners"] = Effect.fn(
     "AnalyticsService.recordOwners",
-  )((owners, observedBy) =>
-    Effect.forEach(
+  )(function* (owners, observedBy) {
+    if (!(yield* telemetryEnabled)) return;
+    yield* Effect.forEach(
       owners,
       ({ source, ownerId }) =>
         Ref.modify(recordedOwnersRef, (recorded) => {
@@ -347,8 +354,8 @@ export const make = Effect.gen(function* () {
           ),
         ),
       { discard: true },
-    ),
-  );
+    );
+  });
 
   yield* Effect.forever(Effect.sleep(FLUSH_INTERVAL_MS).pipe(Effect.andThen(flushWhenDue)), {
     disableYield: true,

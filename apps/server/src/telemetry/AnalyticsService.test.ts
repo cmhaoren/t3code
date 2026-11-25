@@ -203,6 +203,71 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AnalyticsService
     }),
   );
 
+  it.effect("sends nothing while DO_NOT_TRACK is set", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = { DO_NOT_TRACK: "1" };
+      const batches = yield* sendFor(
+        0,
+        respondWithStatus(204),
+        Effect.gen(function* () {
+          const analytics = yield* AnalyticsService.AnalyticsService;
+          yield* analytics.record("test.do-not-track");
+          yield* analytics.flush;
+          env.DO_NOT_TRACK = "0";
+          yield* analytics.record("test.allowed");
+          yield* analytics.flush;
+        }),
+      ).pipe(Effect.provideService(HostProcess.Environment, env));
+      assert.deepEqual(
+        batches.flat().map((event) => event.event),
+        ["test.allowed"],
+      );
+    }),
+  );
+
+  it.effect("defaults off when T3CODE_TELEMETRY_ENABLED is unset", () =>
+    Effect.gen(function* () {
+      const capturedPaths: Array<string> = [];
+      const layerServerConfig = ServerConfig.ServerConfig.layerTest(process.cwd(), {
+        prefix: "t3-telemetry-default-off-",
+      });
+      const layerTelemetry = AnalyticsService.layer.pipe(Layer.provideMerge(layerServerConfig));
+      const layerConfig = ConfigProvider.layer(
+        ConfigProvider.fromUnknown({
+          T3CODE_POSTHOG_KEY: "phc_test_key",
+          T3CODE_POSTHOG_HOST: "http://localhost",
+        }),
+      );
+      const layerBatchServer = HttpServer.serve(
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          capturedPaths.push(request.url);
+          return HttpServerResponse.jsonUnsafe({});
+        }),
+      );
+      const layerRuntime = layerTelemetry.pipe(
+        Layer.provide(layerConfig),
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(HostProcess.Platform, "win32"),
+            Layer.succeed(HostProcess.Architecture, "x64"),
+            ManagedPolicy.layerTest(),
+          ),
+        ),
+        Layer.provideMerge(NodeHttpServer.layerTest),
+      );
+
+      yield* Effect.gen(function* () {
+        yield* Layer.launch(layerBatchServer).pipe(Effect.forkScoped);
+        const analytics = yield* AnalyticsService.AnalyticsService;
+        yield* analytics.record("test.default-off", { index: 1 });
+        yield* analytics.recordOwners([{ source: "connect", ownerId: "a".repeat(64) }], "server");
+        yield* analytics.flush;
+      }).pipe(Effect.provide(layerRuntime));
+
+      assert.deepEqual(capturedPaths, []);
+    }),
+  );
   it.effect("client owner reports cannot use up the server's owner cap", () =>
     Effect.gen(function* () {
       const batches = yield* sendFor(
